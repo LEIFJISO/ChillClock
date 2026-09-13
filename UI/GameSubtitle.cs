@@ -41,6 +41,9 @@ internal sealed class GameSubtitle : MonoBehaviour
     /// <summary>我们这边的字幕是不是还在显示（= 这句台词还没结束）。</summary>
     public bool IsShowing => _routine != null;
 
+    /// <summary>这条字幕是什么时候开始显示的（配合"卡住自愈"用）。</summary>
+    public float ShowingSince { get; private set; }
+
     /// <summary>
     /// 立刻收掉字幕，不等它自己到点。
     ///
@@ -68,23 +71,14 @@ internal sealed class GameSubtitle : MonoBehaviour
     public void Show(string text, float duration)
     {
         if (string.IsNullOrWhiteSpace(text))
-        {
-            Plugin.Log.LogDebug("[Chill Clock] subtitle skipped: 文本为空");
             return;
-        }
 
         // 游戏自己在演出时不要抢字幕框（它可能正在显示自己的台词）
         if (HeroineActionBridge.IsGameSequenceBusy())
-        {
-            Plugin.Log.LogDebug("[Chill Clock] subtitle skipped: 游戏在放演出");
             return;
-        }
 
         if (!EnsureUi())
-        {
-            Plugin.Log.LogDebug("[Chill Clock] subtitle skipped: 拿不到字幕 UI");
             return;
-        }
 
         // 游戏正在用这个字幕框时不要抢：抢过来会把它的 _isActiveNormalText 状态搅乱，
         // 而游戏的剧情脚本是 "if (!IsActiveNormalText()) ActivateNormalText();"，
@@ -94,10 +88,7 @@ internal sealed class GameSubtitle : MonoBehaviour
         // 否则联动台词从第二句起就没有字幕。_routine != null 就是我们自己在显示的标志。
         var ours = _routine != null;
         if (!ours && IsGameUsingSubtitle())
-        {
-            Plugin.Log.LogDebug("[Chill Clock] subtitle skipped: 字幕框被游戏占用");
             return;
-        }
 
         try
         {
@@ -125,12 +116,8 @@ internal sealed class GameSubtitle : MonoBehaviour
             }
             catch (Exception e)
             {
-                Plugin.Log.LogDebug("[Chill Clock] subtitle callback hook failed: " + e.Message);
+                Plugin.Log.LogWarning("[Chill Clock] subtitle callback hook failed: " + e.Message);
             }
-
-            Plugin.Log.LogDebug("[Chill Clock] subtitle show: " + text.Length + " 字 / " +
-                                duration.ToString("0.00") + "s" +
-                                (ours ? "（连播接手）" : ""));
 
             if (_routine != null)
                 StopCoroutine(_routine);
@@ -139,6 +126,7 @@ internal sealed class GameSubtitle : MonoBehaviour
             // 之前只按 0.06 秒/字留时间，短语音（2 秒左右）会"字幕一闪就没了"，
             // 长句子也常常打不完。现在：语音时长 + 1 秒收尾，并且按 0.16 秒/字兜底。
             _routine = StartCoroutine(HideAfter(DisplaySeconds(text, duration)));
+            ShowingSince = Time.realtimeSinceStartup;
         }
         catch (Exception e)
         {

@@ -220,6 +220,94 @@ internal static class HeroineActionBridge
         return false;
     }
 
+    private static object _limitedTimeEventService;
+    private static MethodInfo _isContainCurrentEvent;
+    private static Array _limitedTimeEventTypes;
+    private static float _nextEventLookup;
+
+    /// <summary>
+    /// 游戏自己的限时活动是不是正开着（圣诞 / 愚人节）。
+    ///
+    /// 游戏的 LimitedTimeEventService 用 IsActivateConditionMet() 判断活动期，
+    /// 我们直接问它，比按日期猜准 —— 活动起止、装饰、换装都是游戏自己那套。
+    /// 游戏里只有这两个节日活动，其它节日由 FestivalCalendar 的日期表兜底。
+    /// </summary>
+    public static string GameEventFestivalId()
+    {
+        var service = EnsureLimitedTimeEventService();
+        if (service == null || _isContainCurrentEvent == null)
+            return null;
+
+        try
+        {
+            if (IsEventActive("Christmas2025"))
+                return "christmas";
+            if (IsEventActive("AprilFool2026"))
+                return "aprilfool";
+        }
+        catch
+        {
+            // 活动系统拿不到就当没有活动
+        }
+
+        return null;
+    }
+
+    private static bool IsEventActive(string enumName)
+    {
+        if (_limitedTimeEventTypes == null)
+            return false;
+
+        foreach (var value in _limitedTimeEventTypes)
+        {
+            if (!string.Equals(value.ToString(), enumName, StringComparison.Ordinal))
+                continue;
+
+            return _isContainCurrentEvent.Invoke(_limitedTimeEventService, new[] { value }) is bool active && active;
+        }
+
+        return false;
+    }
+
+    private static object EnsureLimitedTimeEventService()
+    {
+        if (_limitedTimeEventService != null)
+            return _limitedTimeEventService;
+
+        if (Time.realtimeSinceStartup < _nextEventLookup)
+            return null;
+        _nextEventLookup = Time.realtimeSinceStartup + 3f;
+
+        try
+        {
+            if (!EnsureHeroineAi())
+                return null;
+
+            var field = _heroineAi.GetType().GetField(
+                "_limitedTimeEventService", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var service = field?.GetValue(_heroineAi);
+            if (service == null)
+                return null;
+
+            _isContainCurrentEvent = service.GetType().GetMethod(
+                "IsContainCurrentEvent", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+            var enumType = FindType("Bulbul.LimitedTimeEventType");
+            if (enumType != null)
+                _limitedTimeEventTypes = Enum.GetValues(enumType);
+
+            _limitedTimeEventService = service;
+            Plugin.Log.LogInfo("[Chill Clock] 找到游戏限时活动服务（圣诞 / 愚人节按游戏自己的判定走）");
+            return _limitedTimeEventService;
+        }
+        catch (Exception e)
+        {
+            Plugin.Log.LogWarning("[Chill Clock] limited time event lookup failed: " + e.Message);
+            _limitedTimeEventService = null;
+            return null;
+        }
+    }
+
     /// <summary>
     /// 游戏自己正在走"结束通话"演出（HeroineAI._isCurrentGameEndDirection）。
     /// 这段时间不要再拦游戏的退出/收尾，否则它自己的流程会被卡住。

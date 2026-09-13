@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-    public const string Version = "0.7.3";
+    public const string Version = "0.7.4";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -567,7 +567,9 @@ public sealed class Plugin : BaseUnityPlugin
             return ClickReactionResult.PassThrough;
 
         if (!HeroineActionBridge.CanTakeOverClickReaction())
+        {
             return ClickReactionResult.PassThrough;
+        }
 
         var state = _focusActive
             ? "Work"
@@ -575,12 +577,16 @@ public sealed class Plugin : BaseUnityPlugin
 
         var result = _voiceManager.PlayClick(state);
         if (result == VoiceStartResult.Started)
+        {
             return ClickReactionResult.TakeOver;
+        }
 
         // Deferred = 她还在说（我们的台词没完）。这时按游戏自己的规矩"现在不能点"，
         // 让点击流程走那个禁止反馈；既不会插新台词，也不会让游戏叠一条它自己的话。
         if (result == VoiceStartResult.Deferred)
+        {
             return ClickReactionResult.Blocked;
+        }
 
         // Skipped（冷却中 / 池子空）才让游戏走它自己的反应
         return ClickReactionResult.PassThrough;
@@ -631,7 +637,10 @@ public sealed class Plugin : BaseUnityPlugin
         Application.quitting -= OnQuitting;
         AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
         _quitting = true;
-        _voiceManager?.Dispose();
+        // 只有真的在退出时才丢开语音资源：游戏中途发起又取消的"退出"也会走到 OnDestroy，
+        // 那种情况下把资源丢掉会让整个 mod 之后彻底没声音（用户报过这个）。
+        if (Application.isPlaying == false || _quittingAt > 0f)
+            _voiceManager?.Dispose();
         _closeGuard?.Uninstall();
         _escGuard?.Uninstall();
         _guard.OnWindowMinimized -= OnWindowMinimized;

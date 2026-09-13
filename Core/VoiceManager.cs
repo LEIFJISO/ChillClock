@@ -27,11 +27,13 @@ internal enum VoiceStartResult
 
 /// <summary>
 /// 聪音的语音提醒。
-/// 语音包按这个顺序找：
-///   1. DLL 内嵌的 Voices.pack          —— 发布形态，整个 mod 只有一个 ChillClock.dll
-///   2. plugins\ChillClock\Voices.pack  —— 外置包，不重新构建也能换
-///   3. plugins\ChillClock\Voices\      —— 散放的 OGG 目录
-///   4. DLL 内嵌的那几十条 WAV          —— 最后的兜底
+///
+/// 语音**只从 DLL 内嵌的 Voices.pack 里读**：发布形态就是单独一个 ChillClock.dll，
+/// 用户那边不会有额外的语音文件夹，所以不需要外置回退。
+/// （以前还找过 plugins\ChillClock\Voices.pack 和 plugins\ChillClock\Voices，
+///   结果是"删掉那个文件夹就没声音"，已经去掉了。）
+///
+/// 兜底：DLL 里还嵌着最早那几十条 WAV，包读不到时才用得上。
 /// </summary>
 internal sealed class VoiceManager
 {
@@ -51,6 +53,34 @@ internal sealed class VoiceManager
 
     private const float LoadTimeout = 5f;
 
+    /// <summary>已经说过节日台词的那一天（yyyy-MM-dd）；这天不再挑节日台词。</summary>
+    private string _festivalSaidDay = string.Empty;
+
+    /// <summary>
+    /// 看门狗：连播最后一次推进的时间、以及游戏"正在说话"连续持续了多久。
+    ///
+    /// 这两个状态一旦被卡住（协程被中途掐断、游戏那边的 _isFinishedVoice 停在 false），
+    /// 表现就是"她几乎不说话、点她也没反应" —— 因为 Play() 一律返回 Deferred，
+    /// 而点击被我们映射成"现在不能反应"。所以给它们加超时自愈。
+    /// </summary>
+    private float _lastChainTick;
+    private float _gameVoiceBusySince;
+    private bool _loggedGameVoiceStuck;
+    /// <summary>最近一次解码的结果（TryDecode 写，LoadOgg 读；协程之间不好用返回值，就用这个）。</summary>
+    private AudioClip _lastDecoded;
+    /// <summary>单条语音的解码超时：超过就放弃并写日志，别让外面一直等。</summary>
+    private const float DecodeTimeoutSeconds = 6f;
+    /// <summary>"正在解码"标记的最长有效期：超过就当它丢了，允许重新取。</summary>
+    private const float LoadingStuckSeconds = 12f;
+    /// <summary>每条语音是什么时候开始解码的（给上面那个超时用）。</summary>
+    private readonly Dictionary<string, float> _loadingSince = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+    private float _chainStartedAt;
+    private string _chainStage = string.Empty;
+    /// <summary>一条连播的总时长上限：再长也不该超过这个数，超了就是卡住了。</summary>
+    private const float ChainHardLimitSeconds = 45f;
+    private const float ChainStuckSeconds = 20f;
+    private const float GameVoiceStuckSeconds = 30f;
+
     private readonly AudioSource _source;
     private readonly VoiceRunner _runner;
     private readonly GameSubtitle _subtitle;
@@ -62,7 +92,6 @@ internal sealed class VoiceManager
     private readonly List<string> _lru = new List<string>();
     private readonly HashSet<string> _loading = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-    private readonly string _externalDir;
     private readonly string _tempDir;
     private byte[] _packBytes;
     private readonly HashSet<string> _packNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -87,18 +116,124 @@ internal sealed class VoiceManager
         _runner = host.GetComponent<VoiceRunner>() ?? host.AddComponent<VoiceRunner>();
         _subtitle = host.GetComponent<GameSubtitle>() ?? host.AddComponent<GameSubtitle>();
 
-        var pluginDir = Path.GetDirectoryName(typeof(Plugin).Assembly.Location);
-        if (!string.IsNullOrEmpty(pluginDir))
-            _externalDir = Path.Combine(pluginDir, "ChillClock", "Voices");
-
-        _tempDir = Path.Combine(Path.GetTempPath(), "ChillClockVoice");
+        _tempDir = PickTempDir();
         LoadPack();
 
         LoadCatalog();
+        SelfCheckVoices();
     }
 
     /// <summary>
-    /// 先找 DLL 内嵌的语音包，再找外置的 Voices.pack，整个读到内存里。
+    /// 选一个能写的临时目录（语音从包里取出来后要落成文件交给 Unity 解码）。
+    ///
+    /// 优先系统临时目录；写不进去（被安全软件拦、权限异常）就退到游戏自己的
+    /// 持久化目录，再退到插件目录 —— 总有能用的，不会因为"没地方写"而整体没声音。
+    /// </summary>
+    private static string PickTempDir()
+    {
+        var candidates = new List<string>
+        {
+            Path.Combine(Path.GetTempPath(), "ChillClockVoice"),
+            Path.Combine(Application.persistentDataPath ?? ".", "ChillClockVoice"),
+            Path.Combine(Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? ".", "ChillClockVoice"),
+        };
+
+        foreach (var dir in candidates)
+        {
+            try
+            {
+                Directory.CreateDirectory(dir);
+                var probe = Path.Combine(dir, "probe.tmp");
+                File.WriteAllBytes(probe, new byte[] { 1, 2, 3 });
+                File.Delete(probe);
+                return dir;
+            }
+            catch
+            {
+                // 换下一个候选
+            }
+        }
+
+        return candidates[0];
+    }
+
+    /// <summary>
+    /// 启动自检：从语音包里真抽一条出来解码一次，把"语音链路通不通"写进日志。
+    /// 以后有人反馈"她不出声"时，看这一行就能判断是不是文件/解码的问题。
+    /// </summary>
+    private void SelfCheckVoices()
+    {
+        try
+        {
+            var sample = _catalog.Keys.FirstOrDefault(
+                f => f.EndsWith(".ogg", StringComparison.OrdinalIgnoreCase));
+            if (sample == null)
+            {
+                Plugin.Log.LogWarning("[Chill Clock] 语音自检：目录里一条 ogg 都没有（目录没读到？）");
+                return;
+            }
+
+            using var archive = OpenArchive();
+            var entry = archive?.GetEntry(sample);
+            if (entry == null)
+            {
+                Plugin.Log.LogWarning("[Chill Clock] 语音自检：包里找不到 " + sample +
+                                      " —— 内嵌语音包不可用，语音不会响（发布版只有一个 dll，" +
+                                      "出现这种情况请重新下载）");
+                return;
+            }
+
+            using var stream = entry.Open();
+            // 真写到临时目录再比字节数：这一步就是运行时播放前的完整流程，
+            // 它过了就说明"从包里取一条 → 交给 Unity 解码"这条路是通的。
+            Directory.CreateDirectory(_tempDir);
+            var probe = Path.Combine(_tempDir, "selfcheck.ogg");
+            using (var dst = File.Create(probe))
+                stream.CopyTo(dst);
+            var written = new FileInfo(probe).Length;
+
+            if (written != entry.Length)
+            {
+                TryDelete(probe);
+                Plugin.Log.LogWarning("[Chill Clock] 语音自检：写出的文件和包里的不一样（" +
+                                      written + " / " + entry.Length + " 字节），语音可能不正常");
+                return;
+            }
+
+            Plugin.Log.LogInfo("[Chill Clock] 语音自检：取包 OK（内嵌包抽一条 " + sample + "，" +
+                               entry.Length + " 字节；解包目录 " + _tempDir +
+                               "；目录条数 " + _catalog.Count + "）");
+
+            // 关键一步：**真解码一次**。这一步过了才说明"取包 → 落文件 → 交给 Unity 解码"
+            // 整条链路是通的；失败的话日志里会写明超时还是报错，不用靠点她去猜。
+            _runner.StartCoroutine(SelfCheckDecode(sample, probe));
+        }
+        catch (Exception e)
+        {
+            Plugin.Log.LogWarning("[Chill Clock] 语音自检失败：" + e.Message);
+        }
+    }
+
+    /// <summary>启动自检的第二半：把刚写出来的那条真解一次，并写进日志。</summary>
+    private IEnumerator SelfCheckDecode(string sample, string probePath)
+    {
+        yield return TryDecode(sample, probePath);
+        var clip = _lastDecoded;
+        TryDelete(probePath);
+
+        if (clip != null)
+        {
+            Plugin.Log.LogInfo("[Chill Clock] 语音自检：解码 OK（" + sample + "，" +
+                               clip.length.ToString("0.00") + " 秒）—— 语音链路正常");
+            UnityEngine.Object.Destroy(clip);
+            yield break;
+        }
+
+        Plugin.Log.LogWarning("[Chill Clock] 语音自检：解码失败 —— 她不出声就是这一步断了（具体原因看上面那条警告）");
+    }
+
+    /// <summary>
+    /// 把 DLL 内嵌的语音包整个读到内存里。
     ///
     /// 这里**不长期持有 ZipArchive**，只留字节：Mono 的 ZipArchive 一旦释放过
     /// 条目流，底层流就可能一起被关掉，之后所有条目都读不出来
@@ -118,7 +253,7 @@ internal sealed class VoiceManager
                 if (stream != null)
                 {
                     _packBytes = ReadAllBytes(stream);
-                    Plugin.Log.LogInfo("[Chill Clock] voice pack: embedded (" + IndexPack() + " entries)");
+                    Plugin.Log.LogInfo("[Chill Clock] 内嵌语音包：" + IndexPack() + " 条");
                     return;
                 }
             }
@@ -126,28 +261,13 @@ internal sealed class VoiceManager
         catch (Exception e)
         {
             _packBytes = null;
-            Plugin.Log.LogWarning("[Chill Clock] embedded voice pack failed: " + e);
+            Plugin.Log.LogWarning("[Chill Clock] 内嵌语音包读取失败: " + e);
         }
 
-        try
-        {
-            var pluginDir = Path.GetDirectoryName(typeof(Plugin).Assembly.Location);
-            if (!string.IsNullOrEmpty(pluginDir))
-            {
-                var path = Path.Combine(pluginDir, "ChillClock", "Voices.pack");
-                if (File.Exists(path))
-                {
-                    _packBytes = File.ReadAllBytes(path);
-                    Plugin.Log.LogInfo("[Chill Clock] voice pack: " + path + " (" + IndexPack() + " entries)");
-                    return;
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            _packBytes = null;
-            Plugin.Log.LogWarning("[Chill Clock] external voice pack failed: " + e);
-        }
+        // 内嵌包读不到：说清楚，别让人对着"她怎么不说话了"猜
+        _packBytes = null;
+        Plugin.Log.LogWarning("[Chill Clock] 读不到内嵌语音包，语音不会响 —— " +
+                              "请重新下载官方 release 的 ChillClock.dll。");
     }
 
     private static byte[] ReadAllBytes(Stream stream)
@@ -231,10 +351,18 @@ internal sealed class VoiceManager
     /// <summary>退出时丢开语音包。</summary>
     public void Dispose()
     {
+        // 注意：**不要**把 _packBytes / _packNames 丢掉。
+        //
+        // 游戏中途发起过一次"退出"又取消时，我们的 OnDestroy 会被调到 → 以前这里
+        // 就把语音包扔了。之后点击、走神提醒都还会走到我们这（日志能看到"点击：接管"），
+        // 但每条语音都取不到 —— 表现就是"用了之后几乎不说话、点她也没反应"。
+        // 这里只清掉缓存对象，包本身留着。
         try
         {
-            _packBytes = null;
-            _packNames.Clear();
+            _clips.Clear();
+            _lru.Clear();
+            _loading.Clear();
+            _loadingSince.Clear();
         }
         catch
         {
@@ -262,27 +390,72 @@ internal sealed class VoiceManager
 
     private VoiceStartResult Play(string trigger, float cooldown)
     {
-        if (_source == null || _runner == null || _chainRunning || _source.isPlaying)
+        if (_source == null || _runner == null)
+        {
             return VoiceStartResult.Deferred;
+        }
+
+        // 连播"卡住"自愈：正常一句最长十几秒（含等字幕），超过 20 秒没动静就是协程被掐断了
+        var nowChain = Time.realtimeSinceStartup;
+        if (_chainRunning && nowChain - _lastChainTick > ChainStuckSeconds)
+        {
+            Plugin.Log.LogWarning("[Chill Clock] 连播状态卡住了，重置（这样她才会重新开口）");
+            _chainRunning = false;
+            _abortRequested = false;
+            HeroineActionBridge.SetMouthTalk(false);
+        }
+        else if (_chainRunning && _chainStartedAt > 0f && nowChain - _chainStartedAt > ChainHardLimitSeconds)
+        {
+            // 总时长硬上限：协程还活着、但明显太久（例如某个等待循环条件永远不成立）
+            Plugin.Log.LogWarning("[Chill Clock] 连播超过 " + (int)ChainHardLimitSeconds +
+                                  " 秒还没结束（卡在：" + _chainStage + "），强制结束");
+            _chainRunning = false;
+            _abortRequested = true;
+            HeroineActionBridge.SetMouthTalk(false);
+            HeroineActionBridge.EndLineReaction();
+        }
+
+        if (_chainRunning || _source.isPlaying)
+        {
+            return VoiceStartResult.Deferred;
+        }
 
         // 上一句的字幕还在显示 = 她还没说完。这时候不开口（点击也是一样），
         // 免得新句子把上一句的字幕顶掉、或者两句叠在一起。
         if (_subtitle != null && _subtitle.IsShowing)
-            return VoiceStartResult.Deferred;
+        {
+            // 字幕卡住同样会让她彻底不开口（点击也会被当成"现在不能反应"）：
+            // 超过 30 秒还挂着就说明这条收尾协程没跑完，强制收掉。
+            if (Time.realtimeSinceStartup - _subtitle.ShowingSince > 30f)
+            {
+                Plugin.Log.LogWarning("[Chill Clock] 字幕卡住了，强制收起");
+                _subtitle.HideNow();
+            }
+            else
+            {
+                return VoiceStartResult.Deferred;
+            }
+        }
 
         var now = Time.realtimeSinceStartup;
         if (now < _nextAttempt)
+        {
             return VoiceStartResult.Deferred;
+        }
 
         if (_nextTimes.TryGetValue(trigger, out var next) && now < next)
+        {
             return VoiceStartResult.Skipped;
+        }
 
         if (!_pools.TryGetValue(trigger, out var pool) || pool.Count == 0)
+        {
             return VoiceStartResult.Skipped;
+        }
 
         // 游戏自己正在说话时先让路：既不会盖掉它，也不会让它的 PlayVoice 因为
         // _isFinishedVoice 还是 false 而被静默丢弃。
-        if (HeroineActionBridge.IsGameVoiceBusy())
+        if (IsGameVoiceBusySafe())
         {
             _nextAttempt = now + 0.5f;
             return VoiceStartResult.Deferred;
@@ -298,7 +471,9 @@ internal sealed class VoiceManager
 
         var start = Pick(pool);
         if (start == null)
+        {
             return VoiceStartResult.Skipped;
+        }
         _lastPlayed = start;
 
         var chain = _chains.TryGetValue(start, out var found) && found.Count > 1
@@ -333,13 +508,100 @@ internal sealed class VoiceManager
     /// <summary>
     /// 从候选池里抽一条，优先当前时段的专属台词。
     /// 别的时段的台词不会被抽到；一条都不匹配时才退回"未标时段"的中性台词。
+    ///
+    /// 节日台词（目录第 11 列）是另一条硬规则：写着节日的条目**只在当天**参与抽取，
+    /// 别的一律先剔掉；当天则优先说节日台词（留一点概率说平时的，免得整晚都在拜年）。
     /// </summary>
+    /// <summary>
+    /// 问游戏"你是不是正在说话"，但带超时。
+    ///
+    /// 游戏那边的 _isFinishedVoice 一旦停在 false（它自己的语音流程被中途打断就会这样），
+    /// 我们这边会永远让路：一句话都不说、点她也被映射成"现在不能反应" ——
+    /// 用户看到的就是"用了之后很少说话、点击没反应"。
+    /// 所以连续超过 30 秒还报"在说话"，就当它卡住了，先忽略。
+    /// </summary>
+    /// <summary>
+    /// 记一条"这次没开口是因为被挡住了"。同一个原因 10 秒最多写一条，
+    /// 用来排查"用了之后几乎不说话、点她也没反应"这类问题。
+    /// </summary>
+    private bool IsGameVoiceBusySafe()
+    {
+        if (!HeroineActionBridge.IsGameVoiceBusy())
+        {
+            _gameVoiceBusySince = 0f;
+            _loggedGameVoiceStuck = false;
+            return false;
+        }
+
+        var now = Time.realtimeSinceStartup;
+        if (_gameVoiceBusySince <= 0f)
+            _gameVoiceBusySince = now;
+
+        if (now - _gameVoiceBusySince > GameVoiceStuckSeconds)
+        {
+            if (!_loggedGameVoiceStuck)
+            {
+                _loggedGameVoiceStuck = true;
+                Plugin.Log.LogWarning("[Chill Clock] 游戏语音标志疑似卡住（连续 30 秒都在说话），先忽略它");
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
     private string Pick(List<string> pool)
     {
         if (pool.Count == 0)
             return null;
 
-        var now = HeroineActionBridge.GetTimeOfDay();
+        // 节日判定优先用游戏自己的限时活动（圣诞 / 愚人节），其余节日看日期表
+        var today = HeroineActionBridge.GameEventFestivalId() ?? FestivalCalendar.TodayId();
+        var dayKey = DateTime.Now.ToString("yyyy-MM-dd");
+        var timeOfDay = HeroineActionBridge.GetTimeOfDay();
+        var festival = new List<string>();
+        var regular = new List<string>(pool.Count);
+        foreach (var file in pool)
+        {
+            if (!_catalog.TryGetValue(file, out var line))
+            {
+                // 目录里查不到的（理论上不会有）当普通台词处理
+                regular.Add(file);
+                continue;
+            }
+
+            if (string.IsNullOrEmpty(line.Festival))
+            {
+                regular.Add(file);
+                continue;
+            }
+
+            // 节日台词还要过时段这一关：赏月、七夕这类只该在晚上说的，
+            // 目录里同样要写 Time（Night / Evening），不匹配就不参与抽取。
+            if (!string.IsNullOrEmpty(today) &&
+                string.Equals(line.Festival, today, StringComparison.OrdinalIgnoreCase) &&
+                (string.IsNullOrEmpty(line.Time) ||
+                 string.IsNullOrEmpty(timeOfDay) ||
+                 string.Equals(line.Time, timeOfDay, StringComparison.OrdinalIgnoreCase)))
+            {
+                festival.Add(file);
+            }
+            // 其它节日的台词直接丢弃：绝不能在普通日子冒出来
+        }
+
+        // 一天只说一次节日台词：说过就记下日期，这天不再挑节日台词
+        if (festival.Count > 0 && _festivalSaidDay != dayKey)
+        {
+            _festivalSaidDay = dayKey;
+            return festival[UnityEngine.Random.Range(0, festival.Count)];
+        }
+
+        if (regular.Count == 0)
+            return festival.Count > 0 ? festival[UnityEngine.Random.Range(0, festival.Count)] : null;
+
+        pool = regular;
+        var now = timeOfDay;
         if (!string.IsNullOrEmpty(now))
         {
             var matches = new List<string>();
@@ -371,6 +633,8 @@ internal sealed class VoiceManager
     private IEnumerator PlayChain(List<string> files)
     {
         _chainRunning = true;
+        _lastChainTick = Time.realtimeSinceStartup;
+        _chainStartedAt = Time.realtimeSinceStartup;
         try
         {
             // 连播组只在第一句转头：每句都转一次头会看着像"来回扭头"
@@ -382,23 +646,47 @@ internal sealed class VoiceManager
                     break;
 
                 // 游戏自己正在说话时开口，只会两边叠在一起：这句也一起放弃
-                if (!firstLine && HeroineActionBridge.IsGameVoiceBusy())
+                if (!firstLine && IsGameVoiceBusySafe())
                 {
                     Interrupt();
                     break;
                 }
 
                 RequestClip(file);
-                var waited = 0f;
-                while (GetClip(file) == null && waited < LoadTimeout)
+
+                // 等待解码：用**真实时间**做闸门。
+                // 之前用累加 Time.unscaledDeltaTime，一旦这个帧间隔是 0
+                //（后台运行、被打断的那一帧）累加值永远不动，这个循环就永远转下去，
+                // _chainRunning 卡在 true —— 表现就是"点她没反应、走神也不提醒"。
+                _chainStage = "等解码 " + file;
+                var loadDeadline = Time.realtimeSinceStartup + LoadTimeout;
+                while (GetClip(file) == null && Time.realtimeSinceStartup < loadDeadline)
                 {
-                    waited += Time.unscaledDeltaTime;
+                    _lastChainTick = Time.realtimeSinceStartup;
                     yield return null;
                 }
 
                 var clip = GetClip(file);
                 if (clip == null)
+                {
+                    // 等不到就把"正在加载"标记清掉：否则这条语音会被永久跳过，
+                    // 表现就是"点她、走神提醒全都没声音"。日志写清楚状态便于以后排查。
+                    if (_loading.Contains(file))
+                    {
+                        _loading.Remove(file);
+                        _loadingSince.Remove(file);
+                        Plugin.Log.LogWarning("[Chill Clock] 语音没能加载出来：" + file +
+                                              "（已清掉加载标记，下次会重试）");
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning("[Chill Clock] 语音没能加载出来：" + file +
+                                              "（缓存=" + _clips.Count + " 在包内=" +
+                                              (_packBytes != null && _packNames.Contains(file)) + "）");
+                    }
+
                     continue;
+                }
 
                 PlayLine(file, clip, firstLine);
 
@@ -408,6 +696,7 @@ internal sealed class VoiceManager
 
                 // 下一句开口前，先让上一句的字幕读得完：
                 // 短句（语音 1.5 秒、字幕要停 2.5 秒）以前会被下一句直接顶掉，看着就是"一闪"。
+                _chainStage = "句间停顿";
                 var gap = ChainGap;
                 if (line != null)
                 {
@@ -420,10 +709,11 @@ internal sealed class VoiceManager
 
                 // 等上一句字幕真的收掉再开口（含打字机还没打完的情况，最多等 8 秒）。
                 // 判据用字幕组件自己的状态，而不是我们估的时长。
-                var waitedSubtitle = 0f;
-                while (_subtitle != null && _subtitle.IsShowing && waitedSubtitle < 8f)
+                _chainStage = "等字幕收掉";
+                var subtitleDeadline = Time.realtimeSinceStartup + 8f;
+                while (_subtitle != null && _subtitle.IsShowing && Time.realtimeSinceStartup < subtitleDeadline)
                 {
-                    waitedSubtitle += Time.unscaledDeltaTime;
+                    _lastChainTick = Time.realtimeSinceStartup;
                     yield return null;
                 }
 
@@ -433,6 +723,8 @@ internal sealed class VoiceManager
         finally
         {
             _chainRunning = false;
+            _chainStage = string.Empty;
+            _chainStartedAt = 0f;
 
             // 不管中间怎么结束，都收拾干净：视线慢慢回正、表情复位
             HeroineActionBridge.EndLineReaction();
@@ -455,7 +747,9 @@ internal sealed class VoiceManager
             // 不能傻等一整条放完（那样会出现"声音没了嘴还在动"）。
             var waited = 0f;
             var tail = Mathf.Max(0.1f, clip.length - MouthTailMargin);
-            while (waited < tail)
+            var tailDeadline = Time.realtimeSinceStartup + tail + 1f;
+            _chainStage = "口型（无分段）";
+            while (waited < tail && Time.realtimeSinceStartup < tailDeadline)
             {
                 if (IsInterrupted(clip, waited))
                 {
@@ -464,6 +758,7 @@ internal sealed class VoiceManager
                 }
 
                 waited += Time.unscaledDeltaTime;
+                _lastChainTick = Time.realtimeSinceStartup;
                 yield return null;
             }
 
@@ -473,7 +768,9 @@ internal sealed class VoiceManager
 
         var elapsed = 0f;
         var speaking = true;
-        while (elapsed < clip.length)
+        var mouthDeadline = Time.realtimeSinceStartup + clip.length + 1f;
+        _chainStage = "口型 " + line?.File;
+        while (elapsed < clip.length && Time.realtimeSinceStartup < mouthDeadline)
         {
             if (IsInterrupted(clip, elapsed))
             {
@@ -489,6 +786,7 @@ internal sealed class VoiceManager
             }
 
             elapsed += Time.unscaledDeltaTime;
+            _lastChainTick = Time.realtimeSinceStartup;
             yield return null;
         }
 
@@ -509,7 +807,7 @@ internal sealed class VoiceManager
     /// </summary>
     private bool IsInterrupted(AudioClip clip, float elapsed)
     {
-        if (_abortRequested || HeroineActionBridge.IsGameVoiceBusy())
+        if (_abortRequested || IsGameVoiceBusySafe())
             return true;
 
         if (elapsed < 0.2f || elapsed >= clip.length - 0.25f)
@@ -571,7 +869,20 @@ internal sealed class VoiceManager
 
     private AudioClip GetClip(string file)
     {
-        return _clips.TryGetValue(file, out var clip) ? clip : null;
+        if (!_clips.TryGetValue(file, out var clip))
+            return null;
+
+        // Unity 的"假 null"：对象被销毁后 != null 在 C# 层面仍为 true，
+        // 但用起来就是空。以前这种条目会一直留在缓存里，导致这条语音**永远**取不到
+        //（RequestClip 看见它在缓存里就直接返回）—— 点她没声音就是这么来的。
+        if (clip == null)
+        {
+            _clips.Remove(file);
+            _lru.Remove(file);
+            return null;
+        }
+
+        return clip;
     }
 
     private void Store(string file, AudioClip clip)
@@ -591,26 +902,33 @@ internal sealed class VoiceManager
 
     private void RequestClip(string file)
     {
-        if (_clips.ContainsKey(file) || _loading.Contains(file))
+        // 只要手里没有"能用的"音频，就去取 —— 不做"正在加载就跳过"的判重。
+        //
+        // 原因：这个判重状态一旦不同步（解码协程中途没了、缓存里是个空音频），
+        // 这条语音会被**永久**跳过：点她没声音、走神不提醒，而且日志里什么都看不到。
+        // 重复解码最多浪费一点 CPU，比"哑掉"划算得多。
+        if (GetClip(file) != null)
             return;
 
+        // 包被丢过（中途取消的退出会走到 Dispose）就重新加载一次，别让它一直哑着
+        if (_packBytes == null)
+        {
+            Plugin.Log.LogWarning("[Chill Clock] 语音包之前被丢掉了，重新加载：" + file);
+            LoadPack();
+        }
+
+        // 语音只从 DLL 内嵌的包里取（发布形态就一个 dll）。
+        // 以前还支持 plugins\ChillClock\Voices.pack 和 plugins\ChillClock\Voices 两级回退，
+        // 但用户那边根本不会有这两个东西，反而制造了"删了文件夹就没声音"的坑，已经去掉。
         if (_packBytes != null && _packNames.Contains(file))
         {
             _loading.Add(file);
+            _loadingSince[file] = Time.realtimeSinceStartup;
             _runner.StartCoroutine(LoadOggFromPack(file));
             return;
         }
-        else
-        {
-            var path = string.IsNullOrEmpty(_externalDir) ? null : Path.Combine(_externalDir, file);
-            if (path != null && File.Exists(path))
-            {
-                _loading.Add(file);
-                _runner.StartCoroutine(LoadOgg(file, path, false));
-                return;
-            }
-        }
 
+        // 兜底：DLL 里还嵌了最早那几十条 WAV，包读不到时才用得上
         var embedded = LoadEmbedded(file);
         if (embedded != null)
             Store(file, embedded);
@@ -638,9 +956,10 @@ internal sealed class VoiceManager
         }
         catch (Exception e)
         {
-            Plugin.Log.LogWarning("[Chill Clock] pack extract failed: " + file + " " + e);
-            _loading.Remove(file);
-            TryDelete(temp);
+           Plugin.Log.LogWarning("[Chill Clock] pack extract failed: " + file + " " + e);
+           _loading.Remove(file);
+           _loadingSince.Remove(file);
+           TryDelete(temp);
 
             var fallback = LoadEmbedded(file);
             if (fallback != null)
@@ -653,9 +972,87 @@ internal sealed class VoiceManager
 
     private IEnumerator LoadOgg(string file, string path, bool deleteAfterLoad)
     {
-        var request = UnityWebRequestMultimedia.GetAudioClip("file:///" + path.Replace('\\', '/'), AudioType.OGGVORBIS);
-        yield return request.SendWebRequest();
-        _loading.Remove(file);
+        // 解码走 UnityWebRequest（file:// 读临时文件）。
+        // 用户报告过"语音一直不响"，日志显示卡在等解码 —— 也就是这个请求没有回调。
+        // 所以这里改成 **带超时的等待**：超时/失败都写清楚日志，并且换一个目录重试一次。
+        yield return TryDecode(file, path);
+        var clip = _lastDecoded;
+
+        if (clip == null && !string.IsNullOrEmpty(path))
+        {
+            // 换到游戏自己的数据目录再试一次（系统临时目录被安全软件盯上时的退路）
+            // 注意：C# 不允许在带 catch 的 try 里 yield，所以复制和重试分成两步
+            string retryPath = null;
+            try
+            {
+                var retryDir = Path.Combine(Application.persistentDataPath ?? ".", "ChillClockVoice");
+                Directory.CreateDirectory(retryDir);
+                retryPath = Path.Combine(retryDir, Path.GetFileName(path));
+                File.Copy(path, retryPath, true);
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning("[Chill Clock] 换目录重试失败: " + e.Message);
+                retryPath = null;
+            }
+
+            if (retryPath != null)
+            {
+                yield return TryDecode(file, retryPath);
+                clip = _lastDecoded;
+                TryDelete(retryPath);
+            }
+        }
+
+       _loading.Remove(file);
+       _loadingSince.Remove(file);
+
+       if (clip != null)
+        {
+            Store(file, clip);
+            if (deleteAfterLoad)
+                TryDelete(path);
+            yield break;
+        }
+
+        if (deleteAfterLoad)
+            TryDelete(path);
+
+        var embedded = LoadEmbedded(file);
+        if (embedded != null)
+            Store(file, embedded);
+    }
+
+    /// <summary>
+    /// 真正解码一条 ogg：请求 + 超时等待。超时会 <c>Abort()</c> 并写日志，
+    /// 不会再出现"协程一直等、外面什么都听不到"这种哑状态。
+    /// </summary>
+    private IEnumerator TryDecode(string file, string path)
+    {
+        _lastDecoded = null;
+        var url = "file:///" + path.Replace('\\', '/');
+        var request = UnityWebRequestMultimedia.GetAudioClip(url, AudioType.OGGVORBIS);
+        var operation = request.SendWebRequest();
+
+        var deadline = Time.realtimeSinceStartup + DecodeTimeoutSeconds;
+        while (!operation.isDone && Time.realtimeSinceStartup < deadline)
+            yield return null;
+
+        if (!operation.isDone)
+        {
+            Plugin.Log.LogWarning("[Chill Clock] 解码超时（" + DecodeTimeoutSeconds + " 秒）：" + file +
+                                  " ← " + url);
+            try
+            {
+                request.Abort();
+            }
+            catch
+            {
+                // ignore
+            }
+
+            yield break;
+        }
 
         if (request.result == UnityWebRequest.Result.Success)
         {
@@ -666,25 +1063,19 @@ internal sealed class VoiceManager
                 clip.name = file;
                 if (!clip.LoadAudioData())
                     Plugin.Log.LogWarning("[Chill Clock] LoadAudioData failed: " + file);
-                Store(file, clip);
-                if (deleteAfterLoad)
-                    TryDelete(path);
+                _lastDecoded = clip;
                 yield break;
             }
+
             Plugin.Log.LogWarning("[Chill Clock] ogg decode null: " + file);
         }
         else
         {
-            Plugin.Log.LogWarning("[Chill Clock] ogg load failed: " + file + " " + request.error);
+            Plugin.Log.LogWarning("[Chill Clock] ogg load failed: " + file + " " + request.error + " ← " + url);
             request.Dispose();
         }
 
-        if (deleteAfterLoad)
-            TryDelete(path);
-
-        var embedded = LoadEmbedded(file);
-        if (embedded != null)
-            Store(file, embedded);
+        yield break;
     }
 
     private static void TryDelete(string path)
@@ -730,9 +1121,9 @@ internal sealed class VoiceManager
     {
         try
         {
-            if (ReadCatalogFromPack() || ReadCatalogFromFolder())
+            if (ReadCatalogFromPack())
             {
-                // 已从外部语音包读到
+                // 目录来自 DLL 内嵌的语音包（发布形态唯一来源）
             }
             else
             {
@@ -758,6 +1149,14 @@ internal sealed class VoiceManager
 
         BuildPools();
         BuildChains();
+
+        // 启动时把池子/联动组的规模写进日志：一眼看出"是不是池子空了"
+        var summary = new List<string>();
+        foreach (var pair in _pools)
+            summary.Add(pair.Key + "=" + pair.Value.Count);
+        summary.Sort(StringComparer.OrdinalIgnoreCase);
+        Plugin.Log.LogInfo("[Chill Clock] 台词池：" + string.Join("  ", summary) +
+                           "  联动组=" + _chains.Count);
     }
 
     private bool ReadCatalogFromPack()
@@ -792,25 +1191,6 @@ internal sealed class VoiceManager
         }
     }
 
-    private bool ReadCatalogFromFolder()
-    {
-        try
-        {
-            var external = string.IsNullOrEmpty(_externalDir) ? null : Path.Combine(_externalDir, "voice_catalog.tsv");
-            if (external == null || !File.Exists(external))
-                return false;
-
-            ParseCatalog(File.ReadAllLines(external));
-            Plugin.Log.LogInfo("[Chill Clock] external voice catalog: " + _catalog.Count + " lines");
-            return true;
-        }
-        catch (Exception e)
-        {
-            Plugin.Log.LogWarning("[Chill Clock] external catalog failed: " + e.Message);
-            return false;
-        }
-    }
-
     private void ParseCatalog(IEnumerable<string> rows)
     {
         var first = true;
@@ -841,7 +1221,9 @@ internal sealed class VoiceManager
                 // 第 9 列（可选）：Morning / Noon / Evening / Night，留空表示任何时段都能用
                 Time = parts.Length > 8 ? parts[8].Trim() : string.Empty,
                 // 第 10 列（可选）：真正在出声的时间段，用来管口型
-                TalkSpans = parts.Length > 9 ? ParseSpans(parts[9]) : null
+                TalkSpans = parts.Length > 9 ? ParseSpans(parts[9]) : null,
+                // 第 11 列（可选）：节日 id，只有那天才会被选中
+                Festival = parts.Length > 10 ? parts[10].Trim() : string.Empty
             };
             _catalog[line.File] = line;
         }
@@ -891,6 +1273,8 @@ internal sealed class VoiceManager
             }
             pool.Add(line.File);
         }
+
+        // 启动时把每个池子有多少条写进日志：一眼就能看出"是不是池子空了"
     }
 
     private static string GuessTrigger(string file)
@@ -998,6 +1382,12 @@ internal sealed class VoiceManager
         public string SeqGroup;
         public int SeqOrder;
         public string Time;
+
+        /// <summary>
+        /// 节日 id（目录第 11 列，可选）。空表示平时都能用；
+        /// 非空时只有 FestivalCalendar 报出同一个 id 的那天才会被选中。
+        /// </summary>
+        public string Festival;
 
         /// <summary>
         /// 这条语音"真正在出声"的时间段，扁平存成 start,end,start,end…（秒）。
