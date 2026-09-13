@@ -199,6 +199,28 @@ internal static class HeroineActionBridge
     }
 
     /// <summary>
+    /// 游戏是不是正处在一段"依赖自己拥有前台焦点"的演出里。
+    ///
+    /// 只给收窗口用：收别人的窗口会把前台焦点从游戏手里拿走，
+    /// 开场问候、结束通话告别这类演出一失焦就会断，所以那几段时间先不收窗口。
+    ///
+    /// 绝对不要用 IsGameSequenceBusy() 代替它 —— 那个是"她在忙"的宽判据，
+    /// 还算上了野生动作（伸懒腰 / 端杯子）、睡觉、番茄钟动作、点击反应，
+    /// 那些跟窗口焦点毫无关系，用在这里就会变成"她一想事情就不收窗口了"。
+    /// </summary>
+    public static bool IsForegroundCritical()
+    {
+        if (IsScenarioPlaying())
+            return true;
+        if (IsGameEndDirection())
+            return true;
+        if (InvokeServiceFlag("IsLeaveChair"))
+            return true;
+
+        return false;
+    }
+
+    /// <summary>
     /// 游戏自己正在走"结束通话"演出（HeroineAI._isCurrentGameEndDirection）。
     /// 这段时间不要再拦游戏的退出/收尾，否则它自己的流程会被卡住。
     /// </summary>
