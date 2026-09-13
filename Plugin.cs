@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-    public const string Version = "0.7.2";
+    public const string Version = "0.7.3";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -49,6 +49,7 @@ public sealed class Plugin : BaseUnityPlugin
     private float _nextCoreTick;
     private float _nextGuardSweep;
     private bool _quitting;
+    private float _quittingAt;
     private bool _pendingDistractionVoice;
     private bool _pendingTaskManagerVoice;
     private bool _pendingExitVoice;
@@ -329,9 +330,19 @@ public sealed class Plugin : BaseUnityPlugin
 
     private void TickCoreHost()
     {
-        // 退出流程里不要再做任何周期性工作（扫窗口、收窗口、播语音都没意义了）
+        // 退出流程里不要再做任何周期性工作（扫窗口、收窗口、播语音都没意义了）。
+        //
+        // 但是：这次退出有可能被取消（我们自己拦下了它，或者游戏自己取消了），
+        // 那时候进程还活着、Update 还在跑 —— 必须把功能恢复回来，
+        // 否则整个 mod 会"静悄悄地死掉"，表现就是专注时什么都不做了。
         if (_quitting)
-            return;
+        {
+            if (Time.realtimeSinceStartup - _quittingAt < 2f)
+                return;
+
+            _quitting = false;
+            Logger.LogInfo("[Chill Clock] 退出被取消，功能已恢复");
+        }
 
         var now = UnityEngine.Time.realtimeSinceStartup;
         if (now < _nextCoreTick)
@@ -413,18 +424,20 @@ public sealed class Plugin : BaseUnityPlugin
             service.OnStartWork.Subscribe(_ =>
             {
                 _pomodoroSessionActive = true;
-                SetFocusFromEvent(true);
+                SetFocusFromEvent(true, "PomodoroService.OnStartWork");
             }).AddTo(_subscriptions);
             service.OnStartBreak.Subscribe(_ =>
             {
                 _pomodoroSessionActive = true;
-                SetFocusFromEvent(false);
+                SetFocusFromEvent(false, "PomodoroService.OnStartBreak");
             }).AddTo(_subscriptions);
-            service.OnUnpause.Subscribe(type => SetFocusFromEvent(type == Bulbul.PomodoroService.PomodoroType.Work)).AddTo(_subscriptions);
+            service.OnUnpause.Subscribe(type =>
+                SetFocusFromEvent(type == Bulbul.PomodoroService.PomodoroType.Work,
+                    "PomodoroService.OnUnpause(" + type + ")")).AddTo(_subscriptions);
             service.OnCompletePomodoro.Subscribe(_ =>
             {
                 _pomodoroSessionActive = false;
-                SetFocusFromEvent(false);
+                SetFocusFromEvent(false, "PomodoroService.OnCompletePomodoro");
             }).AddTo(_subscriptions);
             _subscribed = true;
             Logger.LogInfo("[Chill Clock] subscribed to PomodoroService events");
@@ -435,7 +448,10 @@ public sealed class Plugin : BaseUnityPlugin
         }
     }
 
-    internal void SetFocusFromEvent(bool active)
+    /// <summary>
+    /// 游戏事件驱动的专注开关。reason 只用来写日志，方便事后看清"是谁把专注关掉的"。
+    /// </summary>
+    internal void SetFocusFromEvent(bool active, string reason = null)
     {
         if (!_masterEnabled.Value)
             return;
@@ -451,7 +467,8 @@ public sealed class Plugin : BaseUnityPlugin
             // 开始专注前攒下的待播提醒（大多是开场收窗口引起的）不要带进来
             ClearPendingVoices();
         }
-        Logger.LogInfo("[Chill Clock] event focus state -> " + (active ? "Work active" : "ended"));
+        Logger.LogInfo("[Chill Clock] event focus state -> " + (active ? "Work active" : "ended") +
+                       (string.IsNullOrEmpty(reason) ? "" : " （来自 " + reason + "）"));
     }
 
     internal void SetPomodoroSessionActive(bool active)
@@ -588,6 +605,7 @@ public sealed class Plugin : BaseUnityPlugin
     private void OnQuitting()
     {
         _quitting = true;
+        _quittingAt = Time.realtimeSinceStartup;
 
         try
         {

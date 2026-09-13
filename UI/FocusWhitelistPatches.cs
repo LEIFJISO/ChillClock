@@ -88,7 +88,7 @@ internal static class PomodoroStartPatch
     {
         Plugin.Instance?.AttachPomodoroService(__instance);
         Plugin.Instance?.SetPomodoroSessionActive(true);
-        Plugin.Instance?.SetFocusFromEvent(true);
+        Plugin.Instance?.SetFocusFromEvent(true, "PomodoroService.StartPomodoro");
     }
 }
 
@@ -107,10 +107,10 @@ internal static class PomodoroTimerEndPatch
             // 到点了：游戏马上要让她自己说一句，先把我们这边正在说的那句掐掉，免得两边叠着
             Plugin.Instance?.AbortVoiceForGameLine();
             Plugin.Instance?.OnBreakStarted();
-                Plugin.Instance?.SetFocusFromEvent(false);
+                Plugin.Instance?.SetFocusFromEvent(false, "PomodoroService.OnTimerEnd(Work)");
             }
             else if (type == Bulbul.PomodoroService.PomodoroType.Break)
-                Plugin.Instance?.SetFocusFromEvent(true);
+                Plugin.Instance?.SetFocusFromEvent(true, "PomodoroService.OnTimerEnd(Break)");
         }
         catch
         {
@@ -124,7 +124,7 @@ internal static class PomodoroResetPatch
     {
         Plugin.Instance?.AttachPomodoroService(__instance);
         Plugin.Instance?.SetPomodoroSessionActive(false);
-        Plugin.Instance?.SetFocusFromEvent(false);
+        Plugin.Instance?.SetFocusFromEvent(false, "PomodoroService.ResetTimer");
     }
 }
 
@@ -134,7 +134,7 @@ internal static class PomodoroCompletePatch
     {
         Plugin.Instance?.AttachPomodoroService(__instance);
         Plugin.Instance?.SetPomodoroSessionActive(false);
-        Plugin.Instance?.SetFocusFromEvent(false);
+        Plugin.Instance?.SetFocusFromEvent(false, "PomodoroService.CompletePomodoroTimer");
     }
 }
 
@@ -142,7 +142,7 @@ internal static class CountupStartPatch
 {
     private static void Prefix()
     {
-        Plugin.Instance?.SetFocusFromEvent(true);
+        Plugin.Instance?.SetFocusFromEvent(true, "CountupService.StartCountup");
     }
 }
 
@@ -157,9 +157,9 @@ internal static class CountupTogglePatch
         {
             // 正计时暂停会切到 Break 状态；恢复则回到 Work。
             if (__instance.IsCurrentWorking())
-                Plugin.Instance?.SetFocusFromEvent(false);
+                Plugin.Instance?.SetFocusFromEvent(false, "CountupService.PlayOrPauseCountupTimer(暂停)");
             else
-                Plugin.Instance?.SetFocusFromEvent(true);
+                Plugin.Instance?.SetFocusFromEvent(true, "CountupService.PlayOrPauseCountupTimer(恢复)");
         }
         catch
         {
@@ -171,7 +171,7 @@ internal static class CountupResetPatch
 {
     private static void Prefix()
     {
-        Plugin.Instance?.SetFocusFromEvent(false);
+        Plugin.Instance?.SetFocusFromEvent(false, "CountupService.ResetTimer");
     }
 }
 
@@ -179,7 +179,7 @@ internal static class CountupCompletePatch
 {
     private static void Postfix()
     {
-        Plugin.Instance?.SetFocusFromEvent(false);
+        Plugin.Instance?.SetFocusFromEvent(false, "CountupService.CompleteCountupTimer");
     }
 }
 
