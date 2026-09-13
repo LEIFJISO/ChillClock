@@ -36,6 +36,22 @@ A BepInEx plugin for *Chill with You : Lo-Fi Story*: **when Satone is focusing, 
 - Satone can play voice reminders when you get distracted, open Task Manager, or try to exit;
 - The settings UI is localized in Simplified Chinese / English / Japanese.
 
+**Satone's voice lines (1,724 in total, all embedded in the DLL)**
+
+| Scene | Total | Chained | Single |
+| --- | ---: | ---: | ---: |
+| Idle chat during focus | 466 | 115 | 351 |
+| Click during focus | 200 | 119 | 81 |
+| Click during a break | 200 | 116 | 84 |
+| Click outside focus | 200 | 111 | 89 |
+| Distraction reminders | 328 | 163 | 165 |
+| Break reminders | 110 | 30 | 80 |
+| Task Manager interception | 110 | 30 | 80 |
+| Game exit interception | 110 | 30 | 80 |
+| **Total** | **1,724** | **714** | **1,010** |
+
+> "Chained" means two or three lines spoken back to back — 339 chains in total. There are also 36 festival lines, spoken only once on the day itself and split by morning / noon / evening / night. The voice pack is embedded in `ChillClock.dll`, so no extra voice folder is needed.
+
 ## Installation
 
 ### Requirements
