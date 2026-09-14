@@ -76,6 +76,7 @@
 
 ## 关于其他Mod
 对演示视频中的界面UI和播放音乐感兴趣的话，可以看 [ChillPatcherLite](https://github.com/anyukari/ChillPatcherLite)
+
 如果您对此游戏其他Mod感兴趣，可参见：[awesome-chillwithyou](https://github.com/clsty/awesome-chillwithyou)
 
 ## 开源协议
