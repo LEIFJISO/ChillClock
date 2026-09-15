@@ -6,105 +6,70 @@ using System.Runtime.InteropServices;
 namespace ChillFocusWhitelist.Core;
 
 /// <summary>
-/// 专注期间不让 Steam 被关掉。
+/// 专注期间不让 Steam 被关掉 —— Steam 一退出会把游戏进程强杀，那一步拦不住，
+/// 所以只能不让它退，两条路一起堵：
 ///
-/// 为什么要它：Steam 一退出就会把游戏进程强杀（拦不住的 —— 日志直接断在半截，
-/// 没有 Unity 的关闭流程、也没有崩溃栈）。所以只能不让 Steam 退出，两条路一起堵：
-///
-///   1. 托盘图标 →「退出 Steam」：那个菜单是 steamwebhelper 用 CEF 画的窗口
-///      （class=Chrome_RenderWidgetHostHWND），没有 Win32 菜单项可以读，
-///      所以直接把落在这种小弹窗上的点击吞掉。
+///   1. 托盘图标 →「退出 Steam」：那个菜单是 steamwebhelper 用 CEF（Chromium）画的弹窗，
+///      没有 Win32 菜单项可以读，所以整块处理 —— 一发现就把这个弹窗隐藏掉。
 ///   2. 任务栏右键 →「关闭窗口 / 退出 Steam」：任务栏按钮来自 Steam 的窗口，
-///      所以把 Steam / steamwebhelper 的可见窗口直接收起来（隐藏），
-///      任务栏上没有按钮，也就没有那个菜单了。
+///      把 Steam / steamwebhelper 的可见窗口收起来（含最小化的），按钮就没了。
 ///
-/// 为什么用隐藏而不是发关闭消息：Steam 把 WM_CLOSE 实现成了"最小化到托盘"，
-/// 发过去它只是最小化，任务栏按钮还在；而且**最小化的窗口同样有按钮**，
-/// 所以两种状态都要收。
+/// <b>为什么不用鼠标钩子</b>：低级鼠标钩子（WH_MOUSE_LL）是同步链 —— 每个鼠标事件
+/// （包括移动）都要先交给我们的进程、等回调返回才发给目标程序；主线程一卡，鼠标就跟着卡。
+/// 改成轮询，而且分两级，保证开销可以忽略：
 ///
-/// 只在"禁止关闭游戏"生效期间工作，其它时候钩子都不装，零影响。
+///   - <b>快巡</b>（每 50ms）：先花一两微秒看"前台窗口 / 光标下的窗口是不是 Steam 的"，
+///     像才继续查类名和尺寸。托盘菜单刚弹出来就会被收掉，用户来不及点。
+///   - <b>慢巡</b>（每 500ms）：全量扫一遍，收 Steam 主窗口。
+///
+/// 只在"禁止关闭游戏"生效期间工作，其它时候一次都不跑。
 /// </summary>
 internal sealed class SteamCloseGuard
 {
-    private const int WhMouseLl = 14;
-    private const int WmLeftButtonDown = 0x0201;
-    private const int WmLeftButtonUp = 0x0202;
     private const int GwlStyle = -16;
     private const int SwHide = 0;
     private const uint GaRoot = 2;
     private const long WsPopup = 0x80000000L;
     private const long WsCaption = 0x00C00000L;
+    private const int PopupSweepMs = 50;
+    private const int FullSweepMs = 500;
 
-    private readonly Func<bool> _shouldBlock;
     private readonly Func<string, string, bool> _isAllowed;
-    private readonly LowLevelMouseProc _proc;
     private readonly EnumWindowsProc _enumProc;
     private readonly HashSet<int> _steamPids = new HashSet<int>();
-    private IntPtr _hook;
+
     private int _nextPidLookup;
-    private int _nextSweep;
+    private int _nextFullSweep;
+    private int _nextPopupSweep;
     private bool _steamAllowed;
 
-    public SteamCloseGuard(Func<bool> shouldBlock, Func<string, string, bool> isAllowed)
+    public SteamCloseGuard(Func<string, string, bool> isAllowed)
     {
-        _shouldBlock = shouldBlock;
         _isAllowed = isAllowed;
-        // 这两个委托必须长期持有：钩子和枚举回调随时可能被系统调进来
-        _proc = Callback;
+        // 枚举回调必须长期持有：系统随时会调进来
         _enumProc = SweepCallback;
     }
 
+    /// <summary>拦下"关闭 Steam"这个动作时叫一声，让聪音播提醒。</summary>
     public Action OnCloseBlocked { get; set; }
 
-    public void EnsureInstalled()
-    {
-        if (_hook != IntPtr.Zero)
-            return;
-
-        try
-        {
-            _hook = SetWindowsHookEx(WhMouseLl, _proc, IntPtr.Zero, 0);
-        }
-        catch
-        {
-            _hook = IntPtr.Zero;
-        }
-    }
-
-    public void Uninstall()
-    {
-        if (_hook == IntPtr.Zero)
-            return;
-
-        try
-        {
-            UnhookWindowsHookEx(_hook);
-        }
-        catch
-        {
-            // 进程要退了，解不掉就算了
-        }
-
-        _hook = IntPtr.Zero;
-    }
-
     /// <summary>
-    /// 把 Steam 的可见窗口收起来（含最小化的）：
+    /// 慢巡：把 Steam 的可见窗口收起来（含最小化的）。
     /// 任务栏上没按钮，就没有"右键任务栏 → 退出 Steam"这条路。
     /// </summary>
     public void SweepSteamWindows()
     {
-        if (_shouldBlock == null || !_shouldBlock())
-            return;
-
         var now = Environment.TickCount;
-        if (now < _nextSweep)
+        if (now < _nextFullSweep)
             return;
-        _nextSweep = now + 500;
+        _nextFullSweep = now + FullSweepMs;
 
         try
         {
             RefreshSteamProcesses();
+            if (_steamAllowed)
+                return;
+
             EnumWindows(_enumProc, IntPtr.Zero);
         }
         catch
@@ -113,86 +78,56 @@ internal sealed class SteamCloseGuard
         }
     }
 
-    private bool SweepCallback(IntPtr hwnd, IntPtr lParam)
-    {
-        try
-        {
-            GetWindowThreadProcessId(hwnd, out var pid);
-            if (pid == 0 || !_steamPids.Contains((int)pid))
-                return true;
-
-            // 最小化的窗口也有任务栏按钮，一样要收（Steam 主窗口大多数时候就是最小化的）
-            if (!IsWindowVisible(hwnd))
-                return true;
-
-            // 白名单里的 Steam 不动：用户明确把它加进白名单，就是想专注期间也能用
-            if (_steamAllowed || IsPathAllowed(pid))
-                return true;
-
-            ShowWindow(hwnd, SwHide);
-        }
-        catch
-        {
-            // 单个窗口失败不影响其它
-        }
-
-        return true;
-    }
-
-    private IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam)
-    {
-        try
-        {
-            var message = wParam.ToInt32();
-            if (nCode >= 0 &&
-                (message == WmLeftButtonDown || message == WmLeftButtonUp) &&
-                _shouldBlock != null &&
-                _shouldBlock())
-            {
-                var info = Marshal.PtrToStructure<MouseHookStruct>(lParam);
-                if (IsSteamPopupClick(info.Point))
-                {
-                    OnCloseBlocked?.Invoke();
-                    return (IntPtr)1; // 吞掉这次点击
-                }
-
-            }
-        }
-        catch
-        {
-            // 钩子回调里绝不能抛，出错就放行
-        }
-
-        return CallNextHookEx(_hook, nCode, wParam, lParam);
-    }
-
     /// <summary>
-    /// 点的是不是 Steam（含 steamwebhelper）的小弹窗 —— 托盘菜单就是这类。
-    /// 大窗口（Steam 主界面）放行，不影响正常操作。
+    /// 快巡：只看"前台窗口 / 光标下的窗口"，是 Steam 的小弹窗就隐藏掉（托盘菜单就是它）。
+    ///
+    /// 两级：先做两个几乎免费的判断（是不是 Steam 进程的窗口），像了才查类名和尺寸 ——
+    /// 常见情况每次就一两微秒，而且完全不碰输入路径。
     /// </summary>
-    private bool IsSteamPopupClick(Point point)
+    public void SweepSteamPopups()
     {
-        var hwnd = WindowFromPoint(point);
+        var now = Environment.TickCount;
+        if (now < _nextPopupSweep)
+            return;
+        _nextPopupSweep = now + PopupSweepMs;
+
+        try
+        {
+            RefreshSteamProcesses();
+            if (_steamAllowed || _steamPids.Count == 0)
+                return;
+
+            TryHideSteamPopup(GetForegroundWindow());
+
+            if (GetCursorPos(out var cursor))
+                TryHideSteamPopup(WindowFromPoint(cursor));
+        }
+        catch
+        {
+            // 同上
+        }
+    }
+
+    private void TryHideSteamPopup(IntPtr hwnd)
+    {
         if (hwnd == IntPtr.Zero)
-            return false;
+            return;
 
         var root = GetAncestor(hwnd, GaRoot);
         if (root == IntPtr.Zero)
             root = hwnd;
 
         GetWindowThreadProcessId(root, out var pid);
-        if (pid == 0)
-            return false;
+        if (pid == 0 || !_steamPids.Contains((int)pid))
+            return;
 
-        // 这里**不刷新**进程列表：钩子回调在系统输入路径上，枚举进程会卡住这次点击。
-        // 列表由主线程的 SweepSteamWindows() 每 0.5 秒刷新一次，够用。
-        if (_steamAllowed || !_steamPids.Contains((int)pid))
-            return false;
+        if (!IsWindowVisible(root) || !IsPopupLike(root))
+            return;
 
-        return IsPopupLike(root);
+        if (ShowWindow(root, SwHide))
+            OnCloseBlocked?.Invoke();
     }
 
-    /// <summary>Steam 在白名单里就别管它（用户想专注期间也能用 Steam）。</summary>
     private bool IsPathAllowed(uint pid)
     {
         if (_isAllowed == null)
@@ -219,7 +154,7 @@ internal sealed class SteamCloseGuard
         if (width <= 0 || height <= 0)
             return false;
 
-        // Steam 主界面那种大窗口放行
+        // Steam 主界面那种大窗口交给慢巡处理
         if (width > 1200 || height > 900)
             return false;
 
@@ -227,6 +162,26 @@ internal sealed class SteamCloseGuard
         var popup = (style & WsPopup) != 0;
         var hasCaption = (style & WsCaption) == WsCaption;
         return popup || !hasCaption;
+    }
+
+    private bool SweepCallback(IntPtr hwnd, IntPtr lParam)
+    {
+        try
+        {
+            GetWindowThreadProcessId(hwnd, out var pid);
+            if (pid == 0 || !_steamPids.Contains((int)pid))
+                return true;
+
+            // 最小化的窗口也有任务栏按钮，一样要收（Steam 主窗口大多数时候就是最小化的）
+            if (IsWindowVisible(hwnd))
+                ShowWindow(hwnd, SwHide);
+        }
+        catch
+        {
+            // 单个窗口失败不影响其它
+        }
+
+        return true;
     }
 
     private void RefreshSteamProcesses()
@@ -271,16 +226,6 @@ internal sealed class SteamCloseGuard
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct MouseHookStruct
-    {
-        public Point Point;
-        public uint MouseData;
-        public uint Flags;
-        public uint Time;
-        public IntPtr ExtraInfo;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
     private struct Rect
     {
         public int Left;
@@ -290,43 +235,34 @@ internal sealed class SteamCloseGuard
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc callback, IntPtr module, uint threadId);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool UnhookWindowsHookEx(IntPtr hook);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr CallNextHookEx(IntPtr hook, int nCode, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr WindowFromPoint(Point point);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetParent(IntPtr hwnd);
-
-    [DllImport("user32.dll")]
-    private static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
 
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
 
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hwnd, int command);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(Point point);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out Point point);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     private static extern IntPtr GetWindowLongPtr64(IntPtr hwnd, int index);

@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-    public const string Version = "0.8.1";
+    public const string Version = "0.8.2";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -109,9 +109,7 @@ public sealed class Plugin : BaseUnityPlugin
         _guard = new WindowGuard(_store);
         _watcher = new FocusSessionWatcher();
         _uiHider = new FocusUiHider();
-        _steamCloseGuard = new SteamCloseGuard(
-            () => ShouldBlockGameExit(),
-            (path, name) => _store.IsAllowed(path, name));
+        _steamCloseGuard = new SteamCloseGuard((path, name) => _store.IsAllowed(path, name));
         _closeGuard = new CloseGuard(() => ShouldBlockGameExit());
         Application.wantsToQuit += OnWantsToQuit;
         // 退出时尽早把鼠标钩子还回去：它是"系统随时会回调进来"的原生钩子，
@@ -360,14 +358,15 @@ public sealed class Plugin : BaseUnityPlugin
                 _closeGuard?.EnsureInstalled();
             }
 
-            // Steam 退出也会强杀游戏进程，所以一并拦：托盘菜单吞点击 + 把 Steam 窗口收起来
-            _steamCloseGuard?.EnsureInstalled();
+            // Steam 退出也会强杀游戏进程，所以一并拦：
+            //   慢巡收 Steam 主窗口（任务栏按钮消失）+ 快巡收托盘菜单弹窗
+            //   （都不碰输入路径，鼠标不受影响）
             _steamCloseGuard?.SweepSteamWindows();
+            _steamCloseGuard?.SweepSteamPopups();
         }
         else
         {
             _closeGuard?.Uninstall();
-            _steamCloseGuard?.Uninstall();
         }
     }
 
@@ -725,10 +724,9 @@ public sealed class Plugin : BaseUnityPlugin
 
         try
         {
-            _steamCloseGuard?.Uninstall();
             _closeGuard?.Uninstall();
             _uiHider?.RestoreAll();
-            Logger.LogInfo("[Chill Clock] quitting: 已撤掉鼠标钩子");
+            Logger.LogInfo("[Chill Clock] quitting: 已撤掉窗口过程接管");
         }
         catch (Exception e)
         {
@@ -751,7 +749,6 @@ public sealed class Plugin : BaseUnityPlugin
         // 那种情况下把资源丢掉会让整个 mod 之后彻底没声音（用户报过这个）。
         if (Application.isPlaying == false || _quittingAt > 0f)
         _voiceManager?.Dispose();
-        _steamCloseGuard?.Uninstall();
         _closeGuard?.Uninstall();
         _guard.OnWindowMinimized -= OnWindowMinimized;
         _pomodoroServiceInstance = null;
