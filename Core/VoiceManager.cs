@@ -560,6 +560,7 @@ internal sealed class VoiceManager
         var today = HeroineActionBridge.GameEventFestivalId() ?? FestivalCalendar.TodayId();
         var dayKey = DateTime.Now.ToString("yyyy-MM-dd");
         var timeOfDay = HeroineActionBridge.GetTimeOfDay();
+        var hour = DateTime.Now.Hour;
         var festival = new List<string>();
         var regular = new List<string>(pool.Count);
         foreach (var file in pool)
@@ -570,6 +571,12 @@ internal sealed class VoiceManager
                 regular.Add(file);
                 continue;
             }
+
+            // 小时窗：游戏自己的时段只有 Morning/Noon/Evening/Night 四段，
+            // Noon 实际覆盖 11:00-16:59，所以"午饭/午休"这种过了点就很怪的台词
+            // 单独写一个更窄的区间（目录第 12 列），不在区间内就不参与抽取。
+            if (!HourAllows(line, hour))
+                continue;
 
             if (string.IsNullOrEmpty(line.Festival))
             {
@@ -1208,6 +1215,8 @@ internal sealed class VoiceManager
             if (parts.Length < 5)
                 continue;
 
+            var (hourFrom, hourTo) = ParseHour(parts.Length > 11 ? parts[11] : null);
+
             var line = new VoiceLine
             {
                 File = parts[0].Trim(),
@@ -1223,10 +1232,42 @@ internal sealed class VoiceManager
                 // 第 10 列（可选）：真正在出声的时间段，用来管口型
                 TalkSpans = parts.Length > 9 ? ParseSpans(parts[9]) : null,
                 // 第 11 列（可选）：节日 id，只有那天才会被选中
-                Festival = parts.Length > 10 ? parts[10].Trim() : string.Empty
+                Festival = parts.Length > 10 ? parts[10].Trim() : string.Empty,
+                // 第 12 列（可选）：小时区间 "11-14"，留空表示不限
+                HourFrom = hourFrom,
+                HourTo = hourTo
             };
             _catalog[line.File] = line;
         }
+    }
+
+    /// <summary>把 "11-14" 解析成 [11,14) 的起止小时；空值 / 格式不对返回 (-1,-1)。</summary>
+    private static (int From, int To) ParseHour(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return (-1, -1);
+
+        var dash = value.IndexOf('-');
+        if (dash <= 0)
+            return (-1, -1);
+
+        if (int.TryParse(value.Substring(0, dash).Trim(), out var from) &&
+            int.TryParse(value.Substring(dash + 1).Trim(), out var to) &&
+            from >= 0 && to <= 24 && to > from)
+        {
+            return (from, to);
+        }
+
+        return (-1, -1);
+    }
+
+    /// <summary>这条台词现在这个点能不能说（没写小时窗就都能说）。</summary>
+    private static bool HourAllows(VoiceLine line, int hour)
+    {
+        if (line == null || line.HourFrom < 0)
+            return true;
+
+        return hour >= line.HourFrom && hour < line.HourTo;
     }
 
     /// <summary>把 "0.08-1.24;1.62-3.05" 解析成 start,end,start,end… 的扁平数组。</summary>
@@ -1388,6 +1429,16 @@ internal sealed class VoiceManager
         /// 非空时只有 FestivalCalendar 报出同一个 id 的那天才会被选中。
         /// </summary>
         public string Festival;
+
+        /// <summary>
+        /// 小时窗（目录第 12 列，可选，形如 "11-14" 表示 11:00-13:59）。
+        ///
+        /// 游戏自己的时段只有 Morning / Noon / Evening / Night 四段，Noon 覆盖
+        /// 11:00-16:59，午饭/午休这类台词挂在 Noon 上会一直说到下午四五点。
+        /// 这一列用来把这种台词收窄到真正说得通的时段；-1 表示不限。
+        /// </summary>
+        public int HourFrom = -1;
+        public int HourTo = -1;
 
         /// <summary>
         /// 这条语音"真正在出声"的时间段，扁平存成 start,end,start,end…（秒）。

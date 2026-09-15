@@ -39,23 +39,32 @@ internal sealed class FocusUiHider
     private float _stateViewSnapshotExpire;
     private GameObject _rightIcons;
     private GameObject _topIcons;
+    private GameObject _settingEscapeButton;
+    private GameObject _exitEscapeButton;
+    private LockUI _lockSource;
+
+    /// <summary>我们压住的"锁"（游戏自己的 LockUI）和禁用状态，用来还原。</summary>
+    private readonly List<ButtonLock> _locks = new List<ButtonLock>();
 
     private bool _hideStopSkip;
     private bool _hideUi;
     private bool _hideSessionButtons;
+    private bool _lockSessionButtons;
     private bool _stateApplied;
     private float _nextApplyTime;
 
-    public void Tick(bool hideStopSkip, bool hideUi, bool hideSessionButtons)
+    public void Tick(bool hideStopSkip, bool hideUi, bool hideSessionButtons, bool lockSessionButtons)
     {
         var changed = hideStopSkip != _hideStopSkip ||
                       hideUi != _hideUi ||
-                      hideSessionButtons != _hideSessionButtons;
+                      hideSessionButtons != _hideSessionButtons ||
+                      lockSessionButtons != _lockSessionButtons;
         _hideStopSkip = hideStopSkip;
         _hideUi = hideUi;
         _hideSessionButtons = hideSessionButtons;
+        _lockSessionButtons = lockSessionButtons;
 
-        var shouldHide = hideStopSkip || hideUi || hideSessionButtons;
+        var shouldHide = hideStopSkip || hideUi || hideSessionButtons || lockSessionButtons;
         if (changed)
         {
             RestoreAll();
@@ -77,6 +86,12 @@ internal sealed class FocusUiHider
                 HideRightSideUi();
             if (hideSessionButtons)
                 HideSessionEscapeButtons();
+            if (lockSessionButtons)
+                LockSessionEscapeButtons();
+            // 番茄钟的播放/暂停按钮：专注和休息期间都要藏起来（以前就是这样，
+            // 改成"休息时上锁"之后它又冒出来了）
+            if (hideSessionButtons || lockSessionButtons)
+                HideTimerPauseButtons();
             _stateApplied = true;
         }
         catch (Exception e)
@@ -93,7 +108,100 @@ internal sealed class FocusUiHider
             _hiddenTargets.Remove(entry.Target);
         }
         _hidden.Clear();
+
+        RestoreLocks();
         _stateApplied = false;
+    }
+
+    private void RestoreLocks()
+    {
+        foreach (var entry in _locks)
+            entry.Restore();
+        _locks.Clear();
+    }
+
+    /// <summary>
+    /// 休息阶段：设置 / 结束通话按钮**显示出来**，但用游戏自己的 LockUI 打个锁 + 禁用。
+    ///
+    /// 直接藏掉按钮看着像 UI 缺了一块；游戏自己在"按钮暂时不能用"时就是
+    /// LockUI.Activate() + Button.interactable = false（见 Bulbul.ExitUI、
+    /// DeactivateDecorationButtonUI 的 UpdateLockUIState），这里照抄同一套。
+    /// </summary>
+    private void LockSessionEscapeButtons()
+    {
+        LockButtonByName(ref _settingEscapeButton,
+            "Paremt/PCPlatform/Canvas/UI/MostFrontArea/RightIcons/IconSetting_Button", "IconSetting_Button");
+        LockButtonByName(ref _exitEscapeButton,
+            "Paremt/PCPlatform/Canvas/UI/MostFrontArea/RightIcons/IconExit_Button", "IconExit_Button");
+    }
+
+    private void LockButtonByName(ref GameObject cache, string path, string fallbackName)
+    {
+        var target = ResolveCached(ref cache, path, fallbackName);
+        if (target == null)
+            return;
+
+        for (var i = 0; i < _locks.Count; i++)
+        {
+            if (_locks[i].BelongsTo(target))
+            {
+                // 游戏有可能自己把按钮放回去（它随时在改 interactable），每轮补一次
+                _locks[i].Reapply();
+                return;
+            }
+        }
+
+        var button = target.GetComponentInChildren<Button>(true);
+        var lockUi = target.GetComponentInChildren<LockUI>(true);
+        if (lockUi == null)
+        {
+            if (_lockSource == null)
+                _lockSource = FindExitLockUi();
+
+            // 锁挂在 Bulbul.ExitUI 上、但确实属于这个按钮时就照用它（它还会顺带把按钮压暗）
+            if (_lockSource != null && _lockSource.transform.IsChildOf(target.transform))
+                lockUi = _lockSource;
+        }
+
+        if (lockUi != null)
+        {
+            _locks.Add(new ButtonLock(target, button, lockUi, null));
+            return;
+        }
+
+        // 这个按钮游戏自己没做锁（比如设置按钮）：借结束通话那把锁的图标，
+        // 外形和游戏自带的一致，位置按被锁的按钮居中。
+        if (_lockSource == null)
+            _lockSource = FindExitLockUi();
+        _locks.Add(new ButtonLock(target, button, null, CloneLockVisual(_lockSource, target)));
+    }
+
+    /// <summary>
+    /// 结束通话按钮的锁不一定挂在按钮底下：Bulbul.ExitUI 自己持有一个 _lockUI。
+    /// 找不到按钮内的锁时就去问它。
+    /// </summary>
+    private static LockUI FindExitLockUi()
+    {
+        try
+        {
+            foreach (var behaviour in Resources.FindObjectsOfTypeAll<Bulbul.ExitUI>())
+            {
+                if (behaviour == null)
+                    continue;
+
+                var field = behaviour.GetType().GetField(
+                    "_lockUI",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (field?.GetValue(behaviour) is LockUI lockUi && lockUi != null)
+                    return lockUi;
+            }
+        }
+        catch
+        {
+            // 找不到就算了，至少按钮还是禁用的
+        }
+
+        return null;
     }
 
     private void HideStopAndSkip()
@@ -199,10 +307,25 @@ internal sealed class FocusUiHider
         var names = new[]
         {
             "IconSetting_Button",
-            "IconExit_Button",
-            "PomodoroPlayOrPauseButton"
+            "IconExit_Button"
         };
         foreach (var name in names)
+        {
+            var target = FindActiveByExactName(name);
+            if (target != null)
+                HideTarget(target);
+        }
+    }
+
+    /// <summary>
+    /// 番茄钟 / 正计时的播放暂停按钮：专注和休息期间都藏起来。
+    /// （原来挂在 HideSessionEscapeButtons 里，改成"休息时上锁"之后休息阶段就漏出来了。）
+    /// </summary>
+    private void HideTimerPauseButtons()
+    {
+        PruneDeadTargets();
+
+        foreach (var name in new[] { "PomodoroPlayOrPauseButton", "CountupPlayOrPauseButton" })
         {
             var target = FindActiveByExactName(name);
             if (target != null)
@@ -438,6 +561,115 @@ internal sealed class FocusUiHider
             current = current.parent;
         }
         return false;
+    }
+
+    /// <summary>
+    /// 复制一份游戏自带的锁图标挂到按钮上（给游戏自己没做锁的按钮用）。
+    /// 只借它自己的贴图和结构，位置按被锁的按钮居中。
+    /// </summary>
+    private static GameObject CloneLockVisual(LockUI source, GameObject target)
+    {
+        if (source == null || target == null)
+            return null;
+
+        try
+        {
+            var field = typeof(LockUI).GetField(
+                "_lockImage",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (field?.GetValue(source) is not Image image || image == null)
+                return null;
+
+            var clone = Object.Instantiate(image.gameObject, target.transform);
+            clone.name = "ChillClockLockVisual";
+
+            var cloneRect = clone.GetComponent<RectTransform>();
+            if (cloneRect != null)
+            {
+                cloneRect.anchorMin = new Vector2(0.5f, 0.5f);
+                cloneRect.anchorMax = new Vector2(0.5f, 0.5f);
+                cloneRect.pivot = new Vector2(0.5f, 0.5f);
+                cloneRect.anchoredPosition = Vector2.zero;
+                cloneRect.localScale = Vector3.one;
+
+                var sourceRect = image.rectTransform;
+                if (sourceRect != null)
+                    cloneRect.sizeDelta = sourceRect.sizeDelta;
+            }
+
+            var cloneImage = clone.GetComponent<Image>();
+            if (cloneImage != null)
+            {
+                var color = cloneImage.color;
+                cloneImage.color = new Color(color.r, color.g, color.b, 1f);
+                cloneImage.raycastTarget = false;
+            }
+
+            clone.SetActive(true);
+            return clone;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 一个被"锁住"的按钮：亮出游戏自己的 LockUI，同时把按钮设为不可点。
+    /// 还原时两样都放回去。
+    /// </summary>
+    private sealed class ButtonLock
+    {
+        private readonly GameObject _target;
+        private readonly Button _button;
+        private readonly bool _originalInteractable;
+        private readonly LockUI _lockUi;
+        private readonly bool _lockWasActive;
+        private readonly GameObject _visual;
+
+        public ButtonLock(GameObject target, Button button, LockUI lockUi, GameObject visual)
+        {
+            _target = target;
+            _button = button;
+            if (button != null)
+            {
+                _originalInteractable = button.interactable;
+                button.interactable = false;
+            }
+
+            _lockUi = lockUi;
+            if (lockUi != null)
+            {
+                _lockWasActive = lockUi.IsActive;
+                if (!_lockWasActive)
+                    lockUi.Activate();
+            }
+
+            _visual = visual;
+        }
+
+        public bool BelongsTo(GameObject target)
+        {
+            return _target != null && target != null && _target == target;
+        }
+
+        public void Reapply()
+        {
+            if (_button != null && _button.interactable)
+                _button.interactable = false;
+            if (_lockUi != null && !_lockUi.IsActive)
+                _lockUi.Activate();
+        }
+
+        public void Restore()
+        {
+            if (_button != null)
+                _button.interactable = _originalInteractable;
+            if (_lockUi != null && !_lockWasActive)
+                _lockUi.Deactivate();
+            if (_visual != null)
+                Object.Destroy(_visual);
+        }
     }
 
     private sealed class HiddenEntry

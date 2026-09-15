@@ -38,6 +38,33 @@ internal sealed class GameSubtitle : MonoBehaviour
     private float _nextLookup;
     private bool _warned;
 
+    /// <summary>
+    /// 我们自己在调 ActivateNormalText / StartText（防止被下面的钩子当成"游戏在说话"）。
+    /// </summary>
+    internal static bool InvokingOurs;
+
+    /// <summary>游戏自己往普通字幕框里写字的时刻（0 = 它没在写）。</summary>
+    private static float _gameWroteAt;
+
+    /// <summary>我们这条字幕是什么时候写进框里的。</summary>
+    private float _shownAt;
+
+    /// <summary>
+    /// 游戏自己往字幕框里写字了（它开口了）。
+    ///
+    /// 游戏的流程是 "先 StartText(文字)，再看没激活才 ActivateNormalText()"，
+    /// 所以我们在显示的时候它是**不会**重新激活的，只会把框里的文字换成它的。
+    /// 这时如果我们照常收尾（DeactivateNormalText），会把它的字幕一起淡掉 ——
+    /// 用户看到的就是"聪音说了一句，却没有字幕"。
+    /// </summary>
+    internal static void NotifyGameWroteText()
+    {
+        if (InvokingOurs)
+            return;
+
+        _gameWroteAt = Time.realtimeSinceStartup;
+    }
+
     /// <summary>我们这边的字幕是不是还在显示（= 这句台词还没结束）。</summary>
     public bool IsShowing => _routine != null;
 
@@ -92,13 +119,26 @@ internal sealed class GameSubtitle : MonoBehaviour
 
         try
         {
-            _activate.Invoke(_ui, null);
+            object message;
+            InvokingOurs = true;
+            try
+            {
+                _activate.Invoke(_ui, null);
 
-            var message = _messageField.GetValue(_ui);
-            if (message == null)
-                return;
+                message = _messageField.GetValue(_ui);
+                if (message == null)
+                    return;
 
-            _startText.Invoke(message, new object[] { text });
+                _startText.Invoke(message, new object[] { text });
+            }
+            finally
+            {
+                InvokingOurs = false;
+            }
+
+            // 从现在开始这个框归我们：清掉"游戏在写"的标记
+            _gameWroteAt = 0f;
+            _shownAt = Time.realtimeSinceStartup;
 
             // 让游戏自己在"打完了"的时候通知我们（同一条消息上重复注册会叠加，先清掉旧的）
             _textShowed = false;
@@ -179,6 +219,12 @@ internal sealed class GameSubtitle : MonoBehaviour
         if (_ui == null || _deactivate == null)
             return;
 
+        // 我们显示期间游戏自己开口了（它往框里写了字）：框现在归它，
+        // 我们再 Deactivate 会把它的字幕一起淡掉 —— 那就是"下一句没有字幕"。
+        // 它的字幕由它自己收尾，我们不去碰。
+        if (_gameWroteAt > _shownAt)
+            return;
+
         // 必须无条件收尾：Show 时我们调了 ActivateNormalText（把 _isActiveNormalText 置 true），
         // 游戏自己的剧情脚本是 "if (!IsActiveNormalText()) ActivateNormalText();"，
         // 这里不收尾的话那个标记会一直留在 true，游戏之后就不再激活自己的字幕框，剧情状态错位。
@@ -189,12 +235,17 @@ internal sealed class GameSubtitle : MonoBehaviour
         try
         {
             // onEndAction 传 null：游戏那边会自己判空
+            InvokingOurs = true;
             _deactivate.Invoke(_ui, new object[] { null });
         }
         catch (Exception e)
         {
             Plugin.Log.LogWarning("[Chill Clock] native subtitle hide failed: " + e.Message);
             Reset();
+        }
+        finally
+        {
+            InvokingOurs = false;
         }
     }
 

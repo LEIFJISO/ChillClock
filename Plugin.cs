@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-    public const string Version = "0.7.4";
+    public const string Version = "0.8.0";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -36,7 +36,7 @@ public sealed class Plugin : BaseUnityPlugin
     private SettingsPageInjector _ui = null!;
     private FocusUiHider _uiHider = null!;
     private CloseGuard _closeGuard = null!;
-    private EscKeyGuard _escGuard = null!;
+    private SteamCloseGuard _steamCloseGuard = null!;
     private VoiceManager _voiceManager = null!;
 
     private bool _focusActive;
@@ -108,7 +108,9 @@ public sealed class Plugin : BaseUnityPlugin
         _watcher = new FocusSessionWatcher();
         _uiHider = new FocusUiHider();
         _closeGuard = new CloseGuard(() => ShouldBlockGameExit());
-        _escGuard = new EscKeyGuard();
+        _steamCloseGuard = new SteamCloseGuard(
+            () => ShouldBlockGameExit(),
+            (path, name) => _store.IsAllowed(path, name));
         Application.wantsToQuit += OnWantsToQuit;
         // 退出时尽早把窗口过程 / 键盘钩子还回去：这两个都是"系统随时会回调进来"的原生钩子，
         // 拖到进程收尾阶段再解，容易变成退出时崩溃（0xc0000005）。
@@ -134,6 +136,7 @@ public sealed class Plugin : BaseUnityPlugin
         _voiceManager = new VoiceManager(hostObject);
         _guard.OnWindowMinimized += OnWindowMinimized;
         _closeGuard.OnCloseBlocked = () => _pendingExitVoice = true;
+        _steamCloseGuard.OnCloseBlocked = () => _pendingExitVoice = true;
         try
         {
             _harmony = new Harmony(Guid);
@@ -171,6 +174,17 @@ public sealed class Plugin : BaseUnityPlugin
             else
                 Logger.LogWarning("HeroineAI.PlayVoice not found; 游戏开口时不会主动让路");
 
+            // 游戏自己写字幕时通知我们：我们在显示期间它只换文字、不重新激活，
+            // 我们收尾时得让开，别把它的字幕一起淡掉
+            var scenarioMessageType = AccessTools.TypeByName("Bulbul.ScenarioTextMessage");
+            var startText = scenarioMessageType == null
+                ? null
+                : AccessTools.Method(scenarioMessageType, "StartText", new[] { typeof(string) });
+            if (startText != null)
+                _harmony.Patch(startText, prefix: PatchMethod("SubtitleTextPatch", "Prefix"));
+            else
+                Logger.LogWarning("ScenarioTextMessage.StartText not found; 游戏自己的字幕可能被我们盖掉");
+
             var patched = _harmony.GetPatchedMethods()
                 .Select(m => m.DeclaringType?.Name + "." + m.Name)
                 .ToList();
@@ -187,7 +201,6 @@ public sealed class Plugin : BaseUnityPlugin
     internal void TickHost()
     {
         UpdateCloseGuard();
-        _escGuard?.EnsureInstalled();
         _ui.Tick();
         _uiHider.Tick(
             _masterEnabled.Value && IsPomodoroSessionActive() && _disableStopSkip.Value,
@@ -196,7 +209,13 @@ public sealed class Plugin : BaseUnityPlugin
             _hideUiDuringFocus.Value,
             _masterEnabled.Value &&
             IsPomodoroSessionActive() &&
-            _hideUiDuringFocus.Value);
+            _hideUiDuringFocus.Value &&
+            _focusActive,
+            // 休息阶段不藏了，改成"显示 + 上锁"（游戏自己的 LockUI）
+            _masterEnabled.Value &&
+            IsPomodoroSessionActive() &&
+            _hideUiDuringFocus.Value &&
+            !_focusActive);
         ProcessVoiceReminders();
         TickAmbientVoice();
         HeroineActionBridge.Enabled = _heroineReactions.Value;
@@ -323,9 +342,18 @@ public sealed class Plugin : BaseUnityPlugin
                           _blockGameExitOnFocus.Value &&
                           (_focusActive || IsPomodoroSessionActive());
         if (shouldGuard)
+        {
             _closeGuard.EnsureInstalled();
+            // Steam 的关闭按钮也要一起拦（Steam 一退出就会强杀游戏进程）
+            _steamCloseGuard?.EnsureInstalled();
+            // 顺手把 Steam 的窗口关掉：任务栏上没按钮，就没有"右键任务栏退出 Steam"这条路
+            _steamCloseGuard?.SweepSteamWindows();
+        }
         else
+        {
             _closeGuard.Uninstall();
+            _steamCloseGuard?.Uninstall();
+        }
     }
 
     private void TickCoreHost()
@@ -616,7 +644,7 @@ public sealed class Plugin : BaseUnityPlugin
         try
         {
             _closeGuard?.Uninstall();
-            _escGuard?.Uninstall();
+            _steamCloseGuard?.Uninstall();
             _uiHider?.RestoreAll();
             Logger.LogInfo("[Chill Clock] quitting: 已撤掉窗口/键盘钩子");
         }
@@ -640,9 +668,9 @@ public sealed class Plugin : BaseUnityPlugin
         // 只有真的在退出时才丢开语音资源：游戏中途发起又取消的"退出"也会走到 OnDestroy，
         // 那种情况下把资源丢掉会让整个 mod 之后彻底没声音（用户报过这个）。
         if (Application.isPlaying == false || _quittingAt > 0f)
-            _voiceManager?.Dispose();
+        _voiceManager?.Dispose();
         _closeGuard?.Uninstall();
-        _escGuard?.Uninstall();
+        _steamCloseGuard?.Uninstall();
         _guard.OnWindowMinimized -= OnWindowMinimized;
         _pomodoroServiceInstance = null;
         _uiHider?.RestoreAll();

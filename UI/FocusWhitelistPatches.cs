@@ -34,6 +34,28 @@ internal static class HeroineVoicePatch
     }
 }
 
+/// <summary>
+/// 游戏自己往普通字幕框里写字（它开口了）时告诉我们一声。
+///
+/// 用的是它自己的流程：先 StartText(文字)，再看 "没激活才 ActivateNormalText()"。
+/// 我们显示字幕期间已经激活了框，所以它只换文字、不重新激活 ——
+/// 我们收尾时如果不知道这件事，就会把它的字幕一起淡掉（"下一句没有字幕"）。
+/// </summary>
+internal static class SubtitleTextPatch
+{
+    private static void Prefix()
+    {
+        try
+        {
+            GameSubtitle.NotifyGameWroteText();
+        }
+        catch
+        {
+            // 字幕是非关键功能，出问题也不能影响游戏本体
+        }
+    }
+}
+
 [HarmonyPatch(typeof(SettingUI), "Activate")]
 internal static class FocusWhitelistActivatePatch
 {

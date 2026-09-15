@@ -49,6 +49,7 @@ internal sealed class SettingsPageInjector
     private GameObject _toast;
     private float _rowWidth = RowWidth;
     private readonly HashSet<Button> _hookedForeignButtons = new HashSet<Button>();
+    private readonly List<GameObject> _appRows = new List<GameObject>();
 
     public static SettingsPageInjector Active { get; private set; }
 
@@ -127,6 +128,13 @@ internal sealed class SettingsPageInjector
                 ApplyPendingFile();
                 if (_dirty)
                     RebuildRows();
+
+                // 白名单行整体右移，抵消整列的左移（必须等页面显示、坐标有效之后再做）
+                if (_pageRoot != null && _pageRoot.activeInHierarchy && _appRowsNeedOffset)
+                {
+                    OffsetAppRows();
+                    _appRowsNeedOffset = false;
+                }
 
                 if (UnityEngine.Time.realtimeSinceStartup >= _nextForeignHookTime)
                 {
@@ -222,6 +230,7 @@ internal sealed class SettingsPageInjector
 
         RefreshUiLanguage();
         ClearChildren(_scrollContent.transform);
+        _appRows.Clear();
 
         _rowWidth = RowWidth;
 
@@ -232,10 +241,11 @@ internal sealed class SettingsPageInjector
         }
 
         // 1. 总开关固定在页面最顶部。
-        AddChild(CreateToggleRow(
+        var masterRow = CreateToggleRow(
             LocalizedText.Pick("启用 Chill Clock", "Enable Chill Clock", "Chill Clock を有効化"),
             _getMasterEnabled(),
-            _setMasterEnabled));
+            _setMasterEnabled);
+        AddChild(masterRow);
 
         // 2. 专注时隐藏番茄钟控制按钮。
         AddChild(CreateToggleRow(
@@ -280,7 +290,10 @@ internal sealed class SettingsPageInjector
         {
             var row = CreateAppEntryRow(entry);
             if (row != null)
+            {
+                _appRows.Add(row);
                 AddChild(row);
+            }
         }
 
         if (_store.Entries.Count == 0)
@@ -290,12 +303,44 @@ internal sealed class SettingsPageInjector
         }
 
         ForceLayoutRebuild(_scrollContent);
+
+        _appRowsNeedOffset = _appRows.Count > 0;
     }
+
+    /// <summary>白名单行整体右移的量（= 整列左移量的相反数，两边正好抵消）。</summary>
+    private const float AppRowOffset = 65f;
+
+    private bool _appRowsNeedOffset;
+
+    /// <summary>
+    /// 白名单那几个行整体往右挪 <see cref="AppRowOffset"/>。
+    /// 整列的左边距是负值（整列往左挪过了），白名单行跟着走就会显得偏左；
+    /// 这里把它们整行的内容再挪回去，上面的设置项列表不受影响。
+    ///
+    /// 必须等页面真正显示之后再调：隐藏状态下各部件坐标还全是 0，挪了也白挪。
+    /// </summary>
+    private void OffsetAppRows()
+    {
+        foreach (var row in _appRows)
+        {
+            var rowRect = row != null ? row.GetComponent<RectTransform>() : null;
+            if (rowRect == null)
+                continue;
+
+            foreach (Transform child in rowRect)
+            {
+                if (child is RectTransform childRect)
+                    childRect.anchoredPosition += new Vector2(AppRowOffset, 0f);
+            }
+        }
+    }
+
 
     private static void ForceLayoutRebuild(GameObject contentRoot)
     {
         if (contentRoot == null)
             return;
+
         LayoutRebuilder.ForceRebuildLayoutImmediate(contentRoot.GetComponent<RectTransform>());
     }
 
@@ -342,7 +387,9 @@ internal sealed class SettingsPageInjector
             iconRect.anchorMin = new Vector2(0f, 0.5f);
             iconRect.anchorMax = new Vector2(0f, 0.5f);
             iconRect.pivot = new Vector2(0.5f, 0.5f);
-            iconRect.anchoredPosition = new Vector2(originalTitleX, 0f);
+            // 图标的**左边缘**和上面那些设置项的文字左边缘对齐（差半个图标宽就是 21px，
+            // 之前直接把图标中心放在文字 X 上，看着就比设置项偏左一点）
+            iconRect.anchoredPosition = new Vector2(originalTitleX + 21f, 0f);
             iconRect.sizeDelta = new Vector2(42f, 42f);
         }
 
@@ -1034,6 +1081,8 @@ internal sealed class SettingsPageInjector
             return;
 
         var content = scrollRect.content;
+        // 横向保持游戏自己的锚点（内容框比视口宽、左侧探出去，游戏自带那页就是这样），
+        // 纵向顶部对齐。
         content.anchorMin = new Vector2(content.anchorMin.x, 1f);
         content.anchorMax = new Vector2(content.anchorMax.x, 0f);
         content.pivot = new Vector2(0.5f, 1f);
@@ -1042,7 +1091,9 @@ internal sealed class SettingsPageInjector
         if (layout == null)
             layout = content.gameObject.AddComponent<VerticalLayoutGroup>();
         layout.spacing = 0f;
-        layout.padding = new RectOffset(24, 24, 8, 24);
+        // ★整列左右平移就改第一个数（负值 = 往左）。
+        // 实测（这个版本的构建）：列表左边距 247px、右边距 117px → 往左挪差的一半 = 65px 就居中了。
+        layout.padding = new RectOffset(-65, 0, 8, 24);
         layout.childAlignment = TextAnchor.UpperLeft;
         layout.childControlHeight = true;
         layout.childControlWidth = true;

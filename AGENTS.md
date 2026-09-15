@@ -25,5 +25,10 @@
 
 - 语音目录 `outputs\ChillClockVoicePack\Voices\voice_catalog.tsv` 是唯一数据源；
   改动都留 `tools\translations-*.tsv` / `lines-*.txt` 存档，方便回滚
+- 目录列：File / Japanese / Chinese / English / Emotion / Trigger / Seq / Order /
+  Time（时段）/ Talk（口型分段）/ Festival（节日）/ Hour（小时窗）。
+  时段只有游戏自己的四段（Morning 6-11 / Noon 11-17 / Evening 17-20 / Night 20-6），
+  午饭、午休这类"过了点就很怪"的台词用第 12 列 Hour 再收窄（形如 `11-14`，
+  见 `tools\set-hour.py`），别只挂 Noon —— 那样会一直说到下午四五点
 - 改完必须：重打包（build-voice-pack.py）→ 重新编译 → 部署，并核对两边 DLL 哈希一致
 - 游戏运行时 DLL 会被占用，替换前先确认 `Chill With You` 进程已退出
