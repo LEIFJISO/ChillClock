@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-    public const string Version = "0.8.0";
+    public const string Version = "0.8.1";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -35,11 +35,13 @@ public sealed class Plugin : BaseUnityPlugin
     private FocusSessionWatcher _watcher = null!;
     private SettingsPageInjector _ui = null!;
     private FocusUiHider _uiHider = null!;
-    private CloseGuard _closeGuard = null!;
     private SteamCloseGuard _steamCloseGuard = null!;
+    private CloseGuard _closeGuard = null!;
     private VoiceManager _voiceManager = null!;
 
     private bool _focusActive;
+    private float _nextMiniWindowCheck;
+    private bool _isMiniWindow;
     private bool _pomodoroSessionActive;
     private Bulbul.PomodoroService _pomodoroServiceInstance;
     private Harmony _harmony = null!;
@@ -107,12 +109,12 @@ public sealed class Plugin : BaseUnityPlugin
         _guard = new WindowGuard(_store);
         _watcher = new FocusSessionWatcher();
         _uiHider = new FocusUiHider();
-        _closeGuard = new CloseGuard(() => ShouldBlockGameExit());
         _steamCloseGuard = new SteamCloseGuard(
             () => ShouldBlockGameExit(),
             (path, name) => _store.IsAllowed(path, name));
+        _closeGuard = new CloseGuard(() => ShouldBlockGameExit());
         Application.wantsToQuit += OnWantsToQuit;
-        // 退出时尽早把窗口过程 / 键盘钩子还回去：这两个都是"系统随时会回调进来"的原生钩子，
+        // 退出时尽早把鼠标钩子还回去：它是"系统随时会回调进来"的原生钩子，
         // 拖到进程收尾阶段再解，容易变成退出时崩溃（0xc0000005）。
         Application.quitting += OnQuitting;
         AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
@@ -135,8 +137,8 @@ public sealed class Plugin : BaseUnityPlugin
         hostObject.AddComponent<FocusHostBehaviour>();
         _voiceManager = new VoiceManager(hostObject);
         _guard.OnWindowMinimized += OnWindowMinimized;
-        _closeGuard.OnCloseBlocked = () => _pendingExitVoice = true;
         _steamCloseGuard.OnCloseBlocked = () => _pendingExitVoice = true;
+        _closeGuard.OnCloseBlocked = () => _pendingExitVoice = true;
         try
         {
             _harmony = new Harmony(Guid);
@@ -184,6 +186,8 @@ public sealed class Plugin : BaseUnityPlugin
                 _harmony.Patch(startText, prefix: PatchMethod("SubtitleTextPatch", "Prefix"));
             else
                 Logger.LogWarning("ScenarioTextMessage.StartText not found; 游戏自己的字幕可能被我们盖掉");
+
+            PatchExternalPiP();
 
             var patched = _harmony.GetPatchedMethods()
                 .Select(m => m.DeclaringType?.Name + "." + m.Name)
@@ -335,24 +339,100 @@ public sealed class Plugin : BaseUnityPlugin
 
     private void UpdateCloseGuard()
     {
-        if (_closeGuard == null)
-            return;
-
         var shouldGuard = _masterEnabled.Value &&
                           _blockGameExitOnFocus.Value &&
                           (_focusActive || IsPomodoroSessionActive());
         if (shouldGuard)
         {
-            _closeGuard.EnsureInstalled();
-            // Steam 的关闭按钮也要一起拦（Steam 一退出就会强杀游戏进程）
+            // 退出拦截：接管游戏窗口过程（右上角 X / Alt+F4 / 任务栏关闭都走这条）。
+            // 但它和"小窗模式"冲突（画中画 mod 会改同一个窗口，专注中按 F3 会崩），
+            // 所以小窗期间自动卸掉，退出小窗再装回来 —— 见 IsMiniWindowMode()。
+            if (IsMiniWindowMode())
+            {
+                // 小窗模式（或者刚切过小窗）：这时候必须让开，别和画中画 mod 抢窗口过程
+                _closeGuard?.Uninstall();
+            }
+            else if (!(_closeGuard?.WasCalledRecently(2f) ?? false))
+            {
+                // 还没在链子里（或者被换掉了）才装。
+                // WasCalledRecently 为真说明我们正在链子里收消息（画中画 mod 可能盖在我们上面），
+                // 这时再多装一次会在链子上出现两个我们 —— 所以既不能装，也不能卸。
+                _closeGuard?.EnsureInstalled();
+            }
+
+            // Steam 退出也会强杀游戏进程，所以一并拦：托盘菜单吞点击 + 把 Steam 窗口收起来
             _steamCloseGuard?.EnsureInstalled();
-            // 顺手把 Steam 的窗口关掉：任务栏上没按钮，就没有"右键任务栏退出 Steam"这条路
             _steamCloseGuard?.SweepSteamWindows();
         }
         else
         {
-            _closeGuard.Uninstall();
+            _closeGuard?.Uninstall();
             _steamCloseGuard?.Uninstall();
+        }
+    }
+
+    /// <summary>
+    /// 画中画 mod（iGPU Savior / Potato Mode）要切小窗了 —— 抢先让开。
+    ///
+    /// 它自己也接管了游戏窗口过程（PiPWindowProc / InstallPiPWindowProc），和我们那套
+    /// 是同一个窗口的两套过程，撞上就会崩在 ntdll 的堆分配里。这里被它的
+    /// SetPiPMode / TogglePiPMode 的前缀调用（见 PiPModeChangePatch），所以能
+    /// 在它动手之前先把我们那套卸掉；两秒后由尺寸判断决定要不要装回来。
+    /// </summary>
+    internal void OnExternalPiPModeChange()
+    {
+        // 让开 3 秒：它切换时会改样式、装/卸自己的窗口过程，这段时间我们绝对不能插手
+        _externalPiPUntil = Time.realtimeSinceStartup + 3f;
+        _closeGuard?.Uninstall();
+    }
+
+    private float _externalPiPUntil;
+    private bool _piPPatched;
+
+    /// <summary>
+    /// 现在是不是"小窗模式"。
+    ///
+    /// 画中画 mod（Potato Mode / iGPU Savior）会把游戏窗口缩到 ~510x480；我们的窗口过程
+    /// 接管和它同时作用时，专注中按 F3 会崩（转储是堆被写坏 + 系统回调进托管代码）。
+    /// 判断方式是看游戏主窗口尺寸 —— 小窗期间把接管让开，退出小窗立刻装回来。
+    ///
+    /// 开销：主窗口句柄是缓存好的，实际只是每 0.1 秒一次 GetWindowRect（微秒级），
+    /// 不是每帧都问。窗口缩放是几十~几百毫秒的过程，0.1 秒足够在画中画动手之前让开。
+    /// </summary>
+    private bool IsMiniWindowMode()
+    {
+        // 画中画 mod 刚切换过：先无条件让开一会儿（它切换时要改窗口样式和窗口过程）
+        if (Time.realtimeSinceStartup < _externalPiPUntil)
+            return true;
+
+        // 挂上了它的切换方法 → 只靠"切换事件"判断，允许切完稳定后在小窗里把接管装回来
+        if (_piPPatched)
+            return false;
+
+        // 没挂上（没装那个 mod / 改了名）→ 退回按窗口尺寸判断
+        var now = Time.realtimeSinceStartup;
+        if (now < _nextMiniWindowCheck)
+            return _isMiniWindow;
+
+        _nextMiniWindowCheck = now + 0.1f;
+        _isMiniWindow = ComputeMiniWindowMode();
+        return _isMiniWindow;
+    }
+
+    private static bool ComputeMiniWindowMode()
+    {
+        try
+        {
+            var hwnd = Win32.GetCurrentProcessMainWindow();
+            if (hwnd == IntPtr.Zero)
+                return false;
+
+            return Win32.TryGetWindowSize(hwnd, out var width, out var height) &&
+                   (width <= 800 || height <= 600);
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -622,19 +702,21 @@ public sealed class Plugin : BaseUnityPlugin
 
     private bool OnWantsToQuit()
     {
-        if (!ShouldBlockGameExit())
+        var block = ShouldBlockGameExit();
+        Logger.LogInfo("[Chill Clock] wantsToQuit 触发，拦截=" + block);
+        if (!block)
             return true;
 
         Logger.LogWarning("[Chill Clock] 番茄钟会话中已拦截退出请求");
+        _pendingExitVoice = true;
         return false;
     }
 
     /// <summary>
-    /// 游戏开始退出：先把我们挂上去的原生钩子全部撤掉，再做别的收尾。
+    /// 游戏开始退出：先把我们挂上去的原生钩子撤掉，再做别的收尾。
     ///
-    /// 顺序很重要 —— Application.quitting 比 OnDestroy 早，赶在 Unity 拆窗口之前
-    /// 把 SetWindowLongPtr 换回原来的窗口过程、把 WH_KEYBOARD_LL 解开，
-    /// 这样窗口被销毁时就不会回调到我们已经卸下的代码。
+    /// 顺序很重要 —— Application.quitting 比 OnDestroy 早，赶在进程收尾之前
+    /// 把 WH_MOUSE_LL 解开，这样就不会回调到已经卸下的代码。
     /// </summary>
     private void OnQuitting()
     {
@@ -643,10 +725,10 @@ public sealed class Plugin : BaseUnityPlugin
 
         try
         {
-            _closeGuard?.Uninstall();
             _steamCloseGuard?.Uninstall();
+            _closeGuard?.Uninstall();
             _uiHider?.RestoreAll();
-            Logger.LogInfo("[Chill Clock] quitting: 已撤掉窗口/键盘钩子");
+            Logger.LogInfo("[Chill Clock] quitting: 已撤掉鼠标钩子");
         }
         catch (Exception e)
         {
@@ -669,8 +751,8 @@ public sealed class Plugin : BaseUnityPlugin
         // 那种情况下把资源丢掉会让整个 mod 之后彻底没声音（用户报过这个）。
         if (Application.isPlaying == false || _quittingAt > 0f)
         _voiceManager?.Dispose();
-        _closeGuard?.Uninstall();
         _steamCloseGuard?.Uninstall();
+        _closeGuard?.Uninstall();
         _guard.OnWindowMinimized -= OnWindowMinimized;
         _pomodoroServiceInstance = null;
         _uiHider?.RestoreAll();
@@ -709,5 +791,38 @@ public sealed class Plugin : BaseUnityPlugin
     private static void SetConfigValue(ConfigEntry<bool> entry, bool value)
     {
         entry.Value = value;
+    }
+
+    /// <summary>
+    /// 挂画中画 mod 的"切换小窗"方法：它一动，我们先把自己的窗口过程接管让开。
+    /// 没装那个 mod（或改了名）就什么都不做。
+    /// </summary>
+    private void PatchExternalPiP()
+    {
+        var type = AccessTools.TypeByName("PotatoOptimization.Features.WindowStateManager");
+        if (type == null)
+            return;
+
+        var patch = PatchMethod("PiPModeChangePatch", "Prefix");
+        var patched = false;
+        foreach (var name in new[] { "SetPiPMode", "TogglePiPMode" })
+        {
+            var original = AccessTools.Method(type, name);
+            if (original == null)
+                continue;
+
+            try
+            {
+                _harmony.Patch(original, prefix: patch);
+                patched = true;
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[Chill Clock] 挂画中画 " + name + " 失败：" + e.Message);
+            }
+        }
+
+        if (patched)
+            _piPPatched = true;
     }
 }

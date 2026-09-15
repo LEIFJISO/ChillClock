@@ -155,6 +155,7 @@ internal sealed class SteamCloseGuard
                     OnCloseBlocked?.Invoke();
                     return (IntPtr)1; // 吞掉这次点击
                 }
+
             }
         }
         catch
@@ -308,6 +309,9 @@ internal sealed class SteamCloseGuard
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetParent(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);

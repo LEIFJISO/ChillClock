@@ -189,6 +189,20 @@ internal static class Win32
         return IsWindow(hWnd);
     }
 
+    /// <summary>窗口的宽高（拿不到返回 false）。</summary>
+    public static bool TryGetWindowSize(IntPtr hWnd, out int width, out int height)
+    {
+        width = 0;
+        height = 0;
+
+        if (hWnd == IntPtr.Zero || !GetWindowRect(hWnd, out var rect))
+            return false;
+
+        width = rect.Right - rect.Left;
+        height = rect.Bottom - rect.Top;
+        return width > 0 && height > 0;
+    }
+
     public static string GetProcessPath(uint pid)
     {
         return TryGetProcessPath(pid);
@@ -368,9 +382,40 @@ internal static class Win32
 
     private static bool IsCloaked(IntPtr hWnd)
     {
+        // 每个窗口过一次桌面合成器是整个扫描里最贵的一步，而 cloaked 状态几乎不变
+        // （只有 UWP 宿主窗口、以及放在别的虚拟桌面上的窗口会是 cloaked），
+        // 所以按句柄缓存几秒 —— 巡逻每 0.5 秒一次，这样能把这项开销削掉大半。
+        var now = Environment.TickCount;
+        if (CloakCache.TryGetValue(hWnd, out var cached) && now < cached.Expire)
+            return cached.Cloaked;
+
+        var cloakedValue = false;
         var result = DwmGetWindowAttribute(hWnd, DwmwaCloaked, out var cloaked, sizeof(int));
-        return result == 0 && cloaked != 0;
+        if (result == 0)
+            cloakedValue = cloaked != 0;
+
+        CloakCache[hWnd] = (cloakedValue, now + 3000);
+        if (CloakCache.Count > 256)
+            PruneCloakCache(now);
+
+        return cloakedValue;
     }
+
+    private static void PruneCloakCache(int now)
+    {
+        var dead = new List<IntPtr>();
+        foreach (var pair in CloakCache)
+        {
+            if (now >= pair.Value.Expire || !IsWindow(pair.Key))
+                dead.Add(pair.Key);
+        }
+
+        foreach (var hwnd in dead)
+            CloakCache.Remove(hwnd);
+    }
+
+    private static readonly Dictionary<IntPtr, (bool Cloaked, int Expire)> CloakCache =
+        new Dictionary<IntPtr, (bool Cloaked, int Expire)>();
 
     private static bool IsShellClass(string className)
     {

@@ -56,6 +56,31 @@ internal static class SubtitleTextPatch
     }
 }
 
+/// <summary>
+/// 画中画 mod（Potato Mode / iGPU Savior）要切换小窗模式时，先跑我们的代码。
+///
+/// 为什么需要：它自己也用 SetWindowLongPtr 接管了游戏窗口过程（PiPWindowProc /
+/// InstallPiPWindowProc），和我们拦退出的那套是**同一个窗口的两套窗口过程** ——
+/// 专注中按 F3 切换时两边撞在一起，会直接崩在 ntdll 的堆分配里。
+///
+/// 所以在这里抢先一步：把我们那套卸掉，等它切完（我们自己的尺寸判断）再装回来。
+/// 两个方法都挂，参数不参与判断 —— 就算猜错方向，最多晚 0.1 秒装回来，没有副作用。
+/// </summary>
+internal static class PiPModeChangePatch
+{
+    private static void Prefix()
+    {
+        try
+        {
+            Plugin.Instance?.OnExternalPiPModeChange();
+        }
+        catch
+        {
+            // 让路失败也不能影响它
+        }
+    }
+}
+
 [HarmonyPatch(typeof(SettingUI), "Activate")]
 internal static class FocusWhitelistActivatePatch
 {

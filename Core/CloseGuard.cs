@@ -5,14 +5,22 @@ using System.Runtime.InteropServices;
 namespace ChillFocusWhitelist.Core;
 
 /// <summary>
-/// 给游戏进程的所有可见顶层窗口挂上关闭消息拦截，
-/// 在专注/休息期间阻止右上角 X、任务栏关闭、Alt+F4 等正常退出。
+/// 给游戏自己的顶层窗口挂上关闭消息拦截，在专注/休息期间阻止
+/// 右上角 X、任务栏关闭、Alt+F4 这些正常退出。
+///
+/// 为什么必须是它：任务栏那条「关闭窗口」是**直接发送**给窗口过程的（不进消息队列），
+/// Unity 自己的 Application.wantsToQuit 也不管这条 —— 实测两条路都拦不到，
+/// 只有接管窗口过程能拦。
+///
+/// 注意：它和"小窗模式"（画中画 mod 会改同一个窗口）冲突，专注中按 F3 会崩，
+/// 所以 <see cref="Plugin"/> 会在小窗模式下把它卸掉，退出小窗再装回来。
 /// </summary>
 internal sealed class CloseGuard
 {
     private const int GwlWndProc = -4;
     private const uint WmClose = 0x0010;
     private const uint WmSyscommand = 0x0112;
+    private const uint WmNcdestroy = 0x0082;
     private const int ScClose = 0xF060;
 
     private readonly Func<bool> _shouldBlock;
@@ -27,7 +35,9 @@ internal sealed class CloseGuard
     /// WM_DESTROY 之类的消息就是 0xc0000005。
     /// </summary>
     private readonly WindowProcDelegate _procDelegate;
+
     private int _nextEnumerateTime;
+    private float _lastCallAt;
 
     public CloseGuard(Func<bool> shouldBlock)
     {
@@ -36,6 +46,18 @@ internal sealed class CloseGuard
     }
 
     public Action OnCloseBlocked { get; set; }
+
+    /// <summary>
+    /// 我们这个过程最近被调用过吗。
+    ///
+    /// 用来判断"我们是不是还在链子里"：画中画 mod 会把自己的过程装在我们上面，
+    /// 这时窗口的当前过程不是我们，但它的过程会往下转给我们 —— 我们照样收得到消息。
+    /// 所以只看"当前过程是不是我们"会误判，再装一次就会在链子里出现两个我们的过程。
+    /// </summary>
+    public bool WasCalledRecently(float withinSeconds)
+    {
+        return UnityEngine.Time.realtimeSinceStartup - _lastCallAt < withinSeconds;
+    }
 
     public void EnsureInstalled()
     {
@@ -67,7 +89,7 @@ internal sealed class CloseGuard
         }
         catch
         {
-            // 同步失败不阻塞主流程。
+            // 同步失败不阻塞主流程
         }
     }
 
@@ -86,7 +108,11 @@ internal sealed class CloseGuard
             if (currentProc == myProc)
                 return;
 
-            RestoreWindow(hwnd, remove: true);
+            // 别人盖在我们上面（画中画 mod 也接管了同一个窗口）：**什么都不要做** ——
+            // 既不要把我们记的旧过程写回去（那会打断它的链，崩在 ntdll），
+            // 也不要把记录删掉（删了以后我们的过程就不知道该往哪转了，会把它的链弄断）。
+            // 保留记录、保留我们那个过程，让它转下来的时候我们继续正常转发。
+            return;
         }
 
         var result = SetWindowLongPtr(
@@ -126,7 +152,7 @@ internal sealed class CloseGuard
         }
         catch
         {
-            // 窗口可能已销毁。
+            // 窗口可能已销毁
         }
 
         if (remove)
@@ -135,8 +161,15 @@ internal sealed class CloseGuard
 
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
+        _lastCallAt = UnityEngine.Time.realtimeSinceStartup;
+
         try
         {
+            // 窗口正在销毁：把记录清掉再照原样转交。
+            // 不清的话，HWND 被系统复用时就会拿着上一个窗口的过程指针去调。
+            if (msg == WmNcdestroy)
+                return PassMessageToOriginal(hwnd, msg, wParam, lParam);
+
             if (msg == WmClose || (msg == WmSyscommand && (wParam.ToInt32() & 0xFFF0) == ScClose))
             {
                 var block = _shouldBlock != null && _shouldBlock();
@@ -152,12 +185,21 @@ internal sealed class CloseGuard
         }
         catch
         {
-            // 回调异常时放行。
+            // 回调异常时放行
         }
 
         return _previousProcs.TryGetValue(hwnd, out var previous)
             ? CallWindowProc(previous, hwnd, msg, wParam, lParam)
-            : IntPtr.Zero;
+            : DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    private IntPtr PassMessageToOriginal(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        if (!_previousProcs.TryGetValue(hwnd, out var previous))
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+
+        _previousProcs.Remove(hwnd);
+        return CallWindowProc(previous, hwnd, msg, wParam, lParam);
     }
 
     private IntPtr PassCloseToOriginal(IntPtr hwnd, IntPtr wParam, IntPtr lParam)
@@ -175,6 +217,13 @@ internal sealed class CloseGuard
     [DllImport("user32.dll", EntryPoint = "CallWindowProcW")]
     private static extern IntPtr CallWindowProc(
         IntPtr previousProc,
+        IntPtr hwnd,
+        uint msg,
+        IntPtr wParam,
+        IntPtr lParam);
+
+    [DllImport("user32.dll", EntryPoint = "DefWindowProcW")]
+    private static extern IntPtr DefWindowProc(
         IntPtr hwnd,
         uint msg,
         IntPtr wParam,
