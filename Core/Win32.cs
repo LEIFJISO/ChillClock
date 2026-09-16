@@ -77,7 +77,7 @@ internal static class Win32
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hWnd, int command);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
@@ -169,9 +169,16 @@ internal static class Win32
         return ShowWindow(hWnd, SwRestore);
     }
 
-    public static void RequestClose(IntPtr hWnd)
+    /// <summary>
+    /// 发 WM_CLOSE 请对方自己关。返回 false = 这条消息根本没送进去，
+    /// 最常见的原因是对方（任务管理器）以管理员权限运行：低权限进程给高权限进程
+    /// 发窗口消息会被 UIPI 丢掉，error 通常是 5（拒绝访问）。
+    /// </summary>
+    public static bool RequestClose(IntPtr hWnd, out int error)
     {
-        PostMessage(hWnd, 0x0010, IntPtr.Zero, IntPtr.Zero);
+        var posted = PostMessage(hWnd, 0x0010, IntPtr.Zero, IntPtr.Zero);
+        error = Marshal.GetLastWin32Error();
+        return posted;
     }
 
     public static bool ForceShowWindow(IntPtr hWnd)
