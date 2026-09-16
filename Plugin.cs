@@ -343,18 +343,6 @@ public sealed class Plugin : BaseUnityPlugin
 
     private void UpdateCloseGuard()
     {
-        // Steam 管控（托盘菜单 + Steam 窗口）只跟"番茄钟会话进行中"绑定，和下面
-        // "禁止关闭游戏"那个开关无关：那个开关会和小窗模式冲突（用户可能因此关掉它），
-        // 但"专注/休息期间别把 Steam 退出"这件事得照旧 —— 一退出游戏进程就被强杀了。
-        // 所以整个会话期间（专注、休息、暂停）都要继续管，休息阶段尤其不能停。
-        if (_masterEnabled.Value && (_focusActive || IsPomodoroSessionActive()))
-        {
-            //   慢巡收 Steam 主窗口（任务栏按钮消失）+ 快巡收托盘菜单弹窗
-            //   （都不碰输入路径，鼠标不受影响）
-            _steamCloseGuard?.SweepSteamWindows();
-            _steamCloseGuard?.SweepSteamPopups();
-        }
-
         var shouldGuard = _masterEnabled.Value &&
                           _blockGameExitOnFocus.Value &&
                           (_focusActive || IsPomodoroSessionActive());
@@ -375,6 +363,12 @@ public sealed class Plugin : BaseUnityPlugin
                 // 这时再多装一次会在链子上出现两个我们 —— 所以既不能装，也不能卸。
                 _closeGuard?.EnsureInstalled();
             }
+
+            // Steam 退出也会强杀游戏进程，所以一并拦：
+            //   慢巡收 Steam 主窗口（任务栏按钮消失）+ 快巡收托盘菜单弹窗
+            //   （都不碰输入路径，鼠标不受影响）
+            _steamCloseGuard?.SweepSteamWindows();
+            _steamCloseGuard?.SweepSteamPopups();
         }
         else
         {
