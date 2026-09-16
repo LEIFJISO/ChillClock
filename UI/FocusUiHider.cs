@@ -50,21 +50,30 @@ internal sealed class FocusUiHider
     private bool _hideUi;
     private bool _hideSessionButtons;
     private bool _lockSessionButtons;
+    private bool _hidePauseButtons;
     private bool _stateApplied;
     private float _nextApplyTime;
 
-    public void Tick(bool hideStopSkip, bool hideUi, bool hideSessionButtons, bool lockSessionButtons)
+    public void Tick(
+        bool hideStopSkip,
+        bool hideUi,
+        bool hideSessionButtons,
+        bool lockSessionButtons,
+        bool hidePauseButtons)
     {
         var changed = hideStopSkip != _hideStopSkip ||
                       hideUi != _hideUi ||
                       hideSessionButtons != _hideSessionButtons ||
-                      lockSessionButtons != _lockSessionButtons;
+                      lockSessionButtons != _lockSessionButtons ||
+                      hidePauseButtons != _hidePauseButtons;
         _hideStopSkip = hideStopSkip;
         _hideUi = hideUi;
         _hideSessionButtons = hideSessionButtons;
         _lockSessionButtons = lockSessionButtons;
+        _hidePauseButtons = hidePauseButtons;
 
-        var shouldHide = hideStopSkip || hideUi || hideSessionButtons || lockSessionButtons;
+        var shouldHide = hideStopSkip || hideUi || hideSessionButtons ||
+                         lockSessionButtons || hidePauseButtons;
         if (changed)
         {
             RestoreAll();
@@ -88,9 +97,8 @@ internal sealed class FocusUiHider
                 HideSessionEscapeButtons();
             if (lockSessionButtons)
                 LockSessionEscapeButtons();
-            // 番茄钟的播放/暂停按钮：专注和休息期间都要藏起来（以前就是这样，
-            // 改成"休息时上锁"之后它又冒出来了）
-            if (hideSessionButtons || lockSessionButtons)
+            // 番茄钟的播放/暂停按钮：专注和休息期间都要藏起来（和"隐藏UI"开关无关）
+            if (hidePauseButtons)
                 HideTimerPauseButtons();
             _stateApplied = true;
         }

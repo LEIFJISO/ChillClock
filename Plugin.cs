@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-    public const string Version = "0.8.3";
+    public const string Version = "0.8.4";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -205,19 +205,25 @@ public sealed class Plugin : BaseUnityPlugin
         UpdateCloseGuard();
         _ui.Tick();
         _uiHider.Tick(
+            // 专注时禁止结束/跳过：藏番茄钟的停止/跳过按钮（独立开关）
             _masterEnabled.Value && IsPomodoroSessionActive() && _disableStopSkip.Value,
+            // 专注时隐藏 UI：藏主界面右侧那列图标
             _masterEnabled.Value &&
             _focusActive &&
             _hideUiDuringFocus.Value,
+            // 设置 / 结束通话：只有"隐藏UI 打开 + 专注中"才藏
             _masterEnabled.Value &&
             IsPomodoroSessionActive() &&
             _hideUiDuringFocus.Value &&
             _focusActive,
-            // 休息阶段不藏了，改成"显示 + 上锁"（游戏自己的 LockUI）
+            // 其余情况一律"显示 + 上锁"（游戏自己的 LockUI）：
+            // 休息阶段，以及"隐藏UI"没打开时的专注阶段 —— 否则这两种情况能直接点结束通话退出
             _masterEnabled.Value &&
             IsPomodoroSessionActive() &&
-            _hideUiDuringFocus.Value &&
-            !_focusActive);
+            (!_focusActive || !_hideUiDuringFocus.Value),
+            // 番茄钟的播放/暂停按钮：整个会话期间都藏（和"隐藏UI"无关）
+            _masterEnabled.Value &&
+            IsPomodoroSessionActive());
         ProcessVoiceReminders();
         TickAmbientVoice();
         HeroineActionBridge.Enabled = _heroineReactions.Value;
