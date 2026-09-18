@@ -28,6 +28,7 @@ public sealed class Plugin : BaseUnityPlugin
     private ConfigEntry<bool> _hideUiDuringFocus = null!;
     private ConfigEntry<bool> _blockGameExitOnFocus = null!;
     private ConfigEntry<bool> _voiceReminders = null!;
+    private ConfigEntry<bool> _ambientVoice = null!;
     private ConfigEntry<bool> _heroineReactions = null!;
     private ConfigEntry<bool> _clickReaction = null!;
     private WhitelistStore _store = null!;
@@ -83,7 +84,13 @@ public sealed class Plugin : BaseUnityPlugin
             "专注期间是否拦截右上角 X / 任务栏关闭等正常退出操作。");
         _voiceReminders = Config.Bind(
             "Focus", "VoiceReminders", true,
-            "走神或尝试退出时是否播放聪音的语音提醒。");
+            "走神 / 任务管理器 / 退出 / 休息开始时是否播放聪音的语音提醒。" +
+            "（专注中的自言自语另有开关，见 AmbientVoice）");
+        // 专注中自言自语：和上面的"提醒语音"相互独立 ——
+        // 只想安安静静专注、但保留走神提醒的话，把这一项关掉即可。
+        _ambientVoice = Config.Bind(
+            "Focus", "AmbientVoice", true,
+            "专注期间是否让聪音偶尔自言自语（Ambient 台词池）。与走神/退出提醒相互独立。");
         _heroineReactions = Config.Bind(
             "Focus", "HeroineReactions", true,
             "念台词时是否让聪音配合动作和表情。关掉后本模组完全不碰游戏的动作/表情/口型系统。");
@@ -127,7 +134,9 @@ public sealed class Plugin : BaseUnityPlugin
             () => _blockGameExitOnFocus.Value,
             value => SetConfigValue(_blockGameExitOnFocus, value),
             () => _voiceReminders.Value,
-            value => SetConfigValue(_voiceReminders, value));
+            value => SetConfigValue(_voiceReminders, value),
+            () => _ambientVoice.Value,
+            value => SetConfigValue(_ambientVoice, value));
 
         var hostObject = new GameObject("ChillClockHost");
         hostObject.hideFlags = HideFlags.HideAndDontSave;
@@ -232,17 +241,41 @@ public sealed class Plugin : BaseUnityPlugin
 
     /// <summary>
     /// 专注中的定时闲聊 / 休息中的闲聊。间隔刻意拉得很开，避免打断专注。
+    ///
+    /// 两段各归各的开关：
+    ///   AmbientVoice   —— 专注中的自言自语（关掉它不影响走神 / 退出提醒）
+    ///   VoiceReminders —— 休息中的闲聊（这一段跟提醒语音共用一个总闸）
+    /// 提醒类语音（走神 / 任务管理器 / 退出 / 休息开始）在 ProcessVoiceReminders 里，不受本方法影响。
     /// </summary>
     private void TickAmbientVoice()
     {
-        if (_voiceManager == null || !_voiceReminders.Value || !_masterEnabled.Value)
+        if (_voiceManager == null || !_masterEnabled.Value)
             return;
+
+        var chatInFocus = _ambientVoice.Value;
+        var chatInBreak = _voiceReminders.Value;
+        if (!chatInFocus && !chatInBreak)
+        {
+            // 两段都不说话：计时器清零，这样下次打开时是"重新计时"，
+            // 而不是因为计时器早就过期、一开就立刻蹦出一句。
+            _nextAmbientVoiceTime = 0f;
+            _nextRestChatTime = 0f;
+            return;
+        }
 
         var now = Time.realtimeSinceStartup;
 
         if (_focusActive)
         {
             _nextRestChatTime = 0f;
+
+            // 自言自语关掉了：不推进计时器，等下次打开时重新计时
+            if (!chatInFocus)
+            {
+                _nextAmbientVoiceTime = 0f;
+                return;
+            }
+
             if (_nextAmbientVoiceTime <= 0f)
             {
                 _nextAmbientVoiceTime = now + 8f * 60f;
@@ -259,6 +292,13 @@ public sealed class Plugin : BaseUnityPlugin
         if (IsPomodoroSessionActive())
         {
             _nextAmbientVoiceTime = 0f;
+
+            if (!chatInBreak)
+            {
+                _nextRestChatTime = 0f;
+                return;
+            }
+
             if (_nextRestChatTime <= 0f)
             {
                 _nextRestChatTime = now + 60f;
@@ -667,12 +707,15 @@ public sealed class Plugin : BaseUnityPlugin
     /// <summary>
     /// 点击反应的处理：开关、状态、以及我们的候选池都得满足才接管。
     /// 她还在说我们这边的台词时返回 Blocked，让游戏出它的禁止光标，而不是被我们吞掉。
+    ///
+    /// 点击台词只归「点击反应」这一个开关管：把"提醒语音"关掉之后，
+    /// 点她照样会说扩充台词（以前这里还 AND 了 VoiceReminders，等于被一起关掉）。
     /// </summary>
     internal ClickReactionResult HandleClickReaction(Bulbul.FacilityClickHeroine.ReactionType reactionType)
     {
         if (!_clickReaction.Value)
             return ClickReactionResult.PassThrough;
-        if (_voiceManager == null || !_voiceReminders.Value || !_masterEnabled.Value)
+        if (_voiceManager == null || !_masterEnabled.Value)
             return ClickReactionResult.PassThrough;
 
         // 只接管"玩家点击"，不碰她自发的 HeroineSelf
