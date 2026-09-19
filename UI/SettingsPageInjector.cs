@@ -30,6 +30,8 @@ internal sealed class SettingsPageInjector
     private readonly Action<bool> _setBlockGameExitOnFocus;
     private readonly Func<bool> _getVoiceReminders;
     private readonly Action<bool> _setVoiceReminders;
+    private readonly Func<bool> _getAmbientVoice;
+    private readonly Action<bool> _setAmbientVoice;
 
     private SettingUI _settingUi;
     private bool _pageBuilt;
@@ -64,7 +66,9 @@ internal sealed class SettingsPageInjector
         Func<bool> getBlockGameExitOnFocus,
         Action<bool> setBlockGameExitOnFocus,
         Func<bool> getVoiceReminders,
-        Action<bool> setVoiceReminders)
+        Action<bool> setVoiceReminders,
+        Func<bool> getAmbientVoice,
+        Action<bool> setAmbientVoice)
     {
         _store = store;
         _getMasterEnabled = getMasterEnabled;
@@ -77,6 +81,8 @@ internal sealed class SettingsPageInjector
         _setBlockGameExitOnFocus = setBlockGameExitOnFocus;
         _getVoiceReminders = getVoiceReminders;
         _setVoiceReminders = setVoiceReminders;
+        _getAmbientVoice = getAmbientVoice;
+        _setAmbientVoice = setAmbientVoice;
         Active = this;
     }
 
@@ -271,7 +277,13 @@ internal sealed class SettingsPageInjector
             _getVoiceReminders(),
             _setVoiceReminders));
 
-        // 6. 添加入口。
+        // 6. 专注中自言自语：独立开关，关掉它不影响上面的提醒语音。
+        AddChild(CreateToggleRow(
+            LocalizedText.Pick("专注中自言自语", "Idle Chat in Focus", "集中中のひとりごと"),
+            _getAmbientVoice(),
+            _setAmbientVoice));
+
+        // 7. 添加入口。
         AddChild(CreateActionRow(
             LocalizedText.Pick("从文件添加应用", "Add App from File", "ファイルからアプリ追加"),
             LocalizedText.Pick("选择程序", "Choose .exe", "ファイルを選択"),
@@ -282,7 +294,7 @@ internal sealed class SettingsPageInjector
             LocalizedText.Pick("打开窗口列表", "Window List", "ウィンドウ一覧"),
             OpenWindowPicker));
 
-        // 7. 白名单列表区（图标在每一行的左侧）。
+        // 8. 白名单列表区（图标在每一行的左侧）。
         AddChild(CreateSectionRow(LocalizedText.Pick("白名单应用", "Whitelisted Apps", "ホワイトリスト")));
         AddChild(CreateDividerRow());
 
