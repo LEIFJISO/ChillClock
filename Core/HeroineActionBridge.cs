@@ -246,6 +246,10 @@ internal static class HeroineActionBridge
     private static object _timeOfDayProvider;
     private static float _nextTimeOfDayLookup;
 
+    /// <summary>"她头上有想说话的气泡吗"用的反射缓存（HeroineAI._wantTalk → HeroineWantTalk._isWantingTalk）。</summary>
+    private static FieldInfo _fWantTalk;
+    private static FieldInfo _fIsWantingTalk;
+
     private static object _voiceManager;
     private static IDictionary _voiceClips;
     private static MethodInfo _voiceManagerPlay;
@@ -421,6 +425,47 @@ internal static class HeroineActionBridge
     public static bool IsGameEndingCall()
     {
         return EnsureHeroineAi() && IsGameEndDirection();
+    }
+
+    /// <summary>
+    /// 聪音头上有没有"想说话"的气泡（= 游戏有剧情准备触发）。
+    ///
+    /// 为什么需要：气泡亮着的时候，点**气泡**（在她头上）会走游戏自己的 UI 流程、直接把剧情接上；
+    /// 点**身体**却会走到我们接管的那条路 —— 用户遇到的就是"点身体一直说我们的台词，点头部才能触发剧情"
+    /// 这种不对称。气泡亮着就代表游戏自己有话要说，这时候我们一律让路。
+    ///
+    /// 取值来源：HeroineAI._wantTalk（HeroineWantTalk）的 IsWantingTalk。
+    /// </summary>
+    public static bool IsWantingTalk()
+    {
+        try
+        {
+            if (!EnsureHeroineAi())
+                return false;
+
+            if (_fWantTalk == null)
+                _fWantTalk = FindField(_heroineAi.GetType(), "_wantTalk");
+            if (_fWantTalk == null)
+                return false;
+
+            var wantTalk = _fWantTalk.GetValue(_heroineAi);
+            if (wantTalk == null)
+                return false;
+
+            if (_fIsWantingTalk == null)
+                _fIsWantingTalk = FindField(wantTalk.GetType(), "_isWantingTalk");
+            if (_fIsWantingTalk == null)
+                return false;
+
+            return _fIsWantingTalk.GetValue(wantTalk) is bool wanting && wanting;
+        }
+        catch
+        {
+            // 取不到就当"没有气泡"，绝不能因为这个判断把点击卡死
+            _fWantTalk = null;
+            _fIsWantingTalk = null;
+            return false;
+        }
     }
 
     /// <summary>

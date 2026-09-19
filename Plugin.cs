@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-public const string Version = "0.9.3";
+public const string Version = "0.9.4";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -839,6 +839,15 @@ public const string Version = "0.9.3";
 
         if (!HeroineActionBridge.CanTakeOverClickReaction())
         {
+            return ClickReactionResult.PassThrough;
+        }
+
+        // 她头上有"想说话"的气泡（剧情准备触发）：这时候点身体会被我们接管，
+        // 点气泡却能触发剧情 —— 用户遇到的就是这个不对称。
+        // 气泡亮着 = 游戏自己有话要说，我们让路，交给游戏自己的点击流程。
+        if (HeroineActionBridge.IsWantingTalk())
+        {
+            Logger.LogInfo("[Chill Clock] 她有想说的话（气泡亮着），这次点击让给游戏");
             return ClickReactionResult.PassThrough;
         }
 
