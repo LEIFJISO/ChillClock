@@ -56,6 +56,12 @@ internal sealed class VoiceManager
     /// <summary>已经说过节日台词的那一天（yyyy-MM-dd）；这天不再挑节日台词。</summary>
     private string _festivalSaidDay = string.Empty;
 
+    /// <summary>上次写进日志的"时段对不上"组合，避免每抽一次就刷一条。</summary>
+    private string _lastLoggedPhaseMismatch = string.Empty;
+
+    /// <summary>最近一次"游戏那边有人开口"的时刻（判定在 DriveMouth 里，这里只做记录）。</summary>
+    private float _gameVoiceStartedAt = -1f;
+
     /// <summary>
     /// 看门狗：连播最后一次推进的时间、以及游戏"正在说话"连续持续了多久。
     ///
@@ -80,6 +86,23 @@ internal sealed class VoiceManager
     private const float ChainHardLimitSeconds = 45f;
     private const float ChainStuckSeconds = 20f;
     private const float GameVoiceStuckSeconds = 30f;
+
+    /// <summary>
+    /// "短音"的上限。游戏那边响这么久以内就当它是动作自带的小声音
+    ///（看书时的嗯声、翻页、呼呼吹气），超过这个长度就当她是真的在说话。
+    ///
+    /// 为什么要区分：这两种声音都会先调 VoiceManager.Stop() 把我们正在播的那条掐掉，
+    /// 但处理方式完全不同 —— 她真开口要让路，动作小声音只该让我们把这一句重放一遍。
+    /// 以前一律当成"她开口了"，用户听到的就是"讲到一半被嗯声打断，而且再也不接上"。
+    /// </summary>
+    private const float ShortBlipSeconds = 1.6f;
+
+    /// <summary>同一句最多被短音打断几次（防死循环：声音一直响就放弃）。</summary>
+    private const int MaxResumesPerLine = 2;
+
+    /// <summary>"游戏刚出过声"的判定窗口。只有在这个窗口里才按短音 / 长句处理，
+    /// 免得游戏那边的语音标志卡住时把我们整段连播判死。</summary>
+    private const float GameVoiceRecentSeconds = 3f;
 
     private readonly AudioSource _source;
     private readonly VoiceRunner _runner;
@@ -312,6 +335,46 @@ internal sealed class VoiceManager
     }
 
     /// <summary>
+    /// 游戏那边有人开口（HeroineAI.PlayVoice）。**不要**立刻把我们的整段作废：
+    /// 动作自带的小声音（看书时的嗯声、翻页、呼呼吹气）也走这条路，直接作废就是
+    /// 用户遇到的"讲到一半被嗯声掐掉，而且再也不接上"。
+    ///
+    /// 这里只做两件事：
+    ///   1) 记一笔时间，交给 DriveMouth 按"这条声音有多长"来判定该重放还是该让路；
+    ///   2) 我们那份音频如果是自己 AudioSource 播的（游戏 Stop() 管不到它），先停掉，
+    ///      免得跟她的声音叠在一起。
+    /// </summary>
+    public void NotifyGameVoiceStarted()
+    {
+        _gameVoiceStartedAt = Time.realtimeSinceStartup;
+
+        if (!_chainRunning && !_source.isPlaying)
+            return;
+
+        if (_playingNative)
+            return;     // 借游戏语音系统播的那条：游戏自己那下 Stop() 已经把它停掉了
+
+        try
+        {
+            _source.Stop();
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    /// <summary>游戏那边是不是刚刚出过声（3 秒以内）。</summary>
+    private bool GameVoiceRecent
+    {
+        get
+        {
+            return _gameVoiceStartedAt > 0f &&
+                   Time.realtimeSinceStartup - _gameVoiceStartedAt <= GameVoiceRecentSeconds;
+        }
+    }
+
+    /// <summary>
     /// 立刻闭嘴：停掉我们的音频（不管它是走游戏语音系统还是走自己的 AudioSource）、
     /// 收掉字幕、关掉口型，并且让连播里还没说的句子作废。
     ///
@@ -496,6 +559,12 @@ internal sealed class VoiceManager
         }
         _lastPlayed = start;
 
+        // 记一条"这次说了什么、当时是什么时段"：以后"冒出不该出现的台词"这类问题，
+        // 日志里一眼就能看到到底是哪条池子挑出来的。
+        Plugin.Log.LogInfo("[Chill Clock] 播放 " + trigger + "：" + start +
+                           "（" + DateTime.Now.ToString("HH:mm") + " / " +
+                           PhaseFromClock(DateTime.Now.Hour) + "）");
+
         var chain = _chains.TryGetValue(start, out var found) && found.Count > 1
             ? found
             : new List<string> { start };
@@ -614,8 +683,23 @@ internal sealed class VoiceManager
         // 节日判定优先用游戏自己的限时活动（圣诞 / 愚人节），其余节日看日期表
         var today = HeroineActionBridge.GameEventFestivalId() ?? FestivalCalendar.TodayId();
         var dayKey = DateTime.Now.ToString("yyyy-MM-dd");
-        var timeOfDay = HeroineActionBridge.GetTimeOfDay();
         var hour = DateTime.Now.Hour;
+        // 时段直接按本机时钟算，规则和游戏自己的 TimeOfDayProvider 一模一样
+        //（早上 6-10 / 中午 11-16 / 傍晚 17-19 / 晚上 20-5）。
+        // 以前这里问的是游戏那边的 provider —— 它读的也是同一个时钟，多一层反射只是
+        // 多一个可能读不到、读到旧值的点。顺便把两边比一下，对不上就写日志。
+        var timeOfDay = PhaseFromClock(hour);
+        var gamePhase = HeroineActionBridge.GetTimeOfDay();
+        var phaseKey = timeOfDay + "|" + gamePhase;
+        if (!string.IsNullOrEmpty(gamePhase) &&
+            !string.Equals(gamePhase, timeOfDay, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(_lastLoggedPhaseMismatch, phaseKey, StringComparison.Ordinal))
+        {
+            _lastLoggedPhaseMismatch = phaseKey;
+            Plugin.Log.LogWarning("[Chill Clock] 时段对不上：游戏说 " + gamePhase +
+                                  "，本机时钟（" + hour + " 点）算出来是 " + timeOfDay +
+                                  "，按本机时钟走");
+        }
         var festival = new List<string>();
         var regular = new List<string>(pool.Count);
         foreach (var file in pool)
@@ -797,10 +881,26 @@ internal sealed class VoiceManager
                     continue;
                 }
 
-                PlayLine(file, clip, firstLine);
-
                 // 口型跟着"真正在出声"的时间段走，台词中间的停顿会闭嘴
                 var line = _catalog.TryGetValue(file, out var found) ? found : null;
+
+                // 最后一道时段闸门：目录里标了时段（Morning / Noon / Evening / Night）的台词
+                // 只在该时段说。抽签那一步已经筛过一次，这里再挡一次 —— 哪怕有哪条路径绕过了
+                // 抽签（连播的后几句、强制指定的开头……），也不会让她在晚上说出"早上好"。
+                if (line != null && !string.IsNullOrEmpty(line.Time))
+                {
+                    var phase = PhaseFromClock(DateTime.Now.Hour);
+                    if (!string.Equals(line.Time, phase, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Plugin.Log.LogWarning("[Chill Clock] 时段不符，跳过这句：" + file +
+                                              "（这句标的是 " + line.Time + "，现在是 " + phase + "）");
+                        if (firstLine)
+                            break;      // 整段第一句就不该说：这一段作废
+                        continue;
+                    }
+                }
+
+                PlayLine(file, clip, firstLine);
                 yield return DriveMouth(clip, line);
 
                 // 下一句开口前，先让上一句的字幕读得完：
@@ -899,23 +999,48 @@ internal sealed class VoiceManager
             var waited = 0f;
             var tail = Mathf.Max(0.1f, clip.length - MouthTailMargin);
             var tailDeadline = Time.realtimeSinceStartup + tail + 1f;
+            var mouthResumes = 0;
             _chainStage = "口型（无分段）";
             while (waited < tail && Time.realtimeSinceStartup < tailDeadline)
             {
-                if (!independent && IsInterrupted(clip, waited))
+                if (IsInterrupted(clip, waited))
                 {
-                    // 她**自己**开口（台词/自言自语）-> 让路，整段不讲了
-                    if (HeroineActionBridge.IsGameVoiceBusy())
+                    if (GameVoiceRecent)
                     {
-                        Interrupt();
-                        yield break;
-                    }
+                        // 是她的台词（长句）还是动作自带的小声音（嗯声 / 翻页 / 呼呼）？
+                        // 前者要让路，后者只该让我们把这一句重放一遍 —— 听它响多久再决定。
+                        if (HeroineActionBridge.IsGameVoiceBusy())
+                        {
+                            var blipDeadline = Time.realtimeSinceStartup + ShortBlipSeconds;
+                            while (HeroineActionBridge.IsGameVoiceBusy() &&
+                                   Time.realtimeSinceStartup < blipDeadline)
+                            {
+                                _lastChainTick = Time.realtimeSinceStartup;
+                                yield return null;
+                            }
 
-                    // 只是短的动作声音（呼呼吹气、翻书嗯声…）把我们掐了：
-                    // 等它放完，把这句从头再说一遍，然后接着往下讲。
-                    var mouthOn = true;
-                    if (!ResumeAfterShortCut(clip, line, ref waited, ref mouthOn))
+                            if (HeroineActionBridge.IsGameVoiceBusy() || mouthResumes >= MaxResumesPerLine)
+                            {
+                                // 她真的在说话（或者同一句被反复掐）：让路，这段不讲了
+                                Interrupt();
+                                yield break;
+                            }
+                        }
+
+                        // 短音（呼呼吹气、翻书嗯声…）：把这句从头再说一遍，然后接着往下讲。
+                        var mouthOn = true;
+                        if (!ResumeAfterShortCut(clip, line, ref waited, ref mouthOn))
+                        {
+                            Interrupt();
+                            yield break;
+                        }
+
+                        mouthResumes++;
+                        tailDeadline = Time.realtimeSinceStartup + tail + 1f;
+                    }
+                    else if (!independent)
                     {
+                        // 没抓到"游戏刚出声"，但我们的音频确实没了：按老办法收工
                         Interrupt();
                         yield break;
                     }
@@ -941,20 +1066,45 @@ internal sealed class VoiceManager
 
         var elapsed = 0f;
         var speaking = true;
+        var resumes = 0;
         var mouthDeadline = Time.realtimeSinceStartup + clip.length + 1f;
         _chainStage = "口型 " + line?.File;
         while (elapsed < clip.length && Time.realtimeSinceStartup < mouthDeadline)
         {
-            if (!independent && IsInterrupted(clip, elapsed))
+            if (IsInterrupted(clip, elapsed))
             {
-                if (HeroineActionBridge.IsGameVoiceBusy())
+                if (GameVoiceRecent)
                 {
-                    Interrupt();
-                    yield break;
-                }
+                    // 同上：先看这条游戏语音有多长，短音重放这一句，长句让路。
+                    if (HeroineActionBridge.IsGameVoiceBusy())
+                    {
+                        var blipDeadline = Time.realtimeSinceStartup + ShortBlipSeconds;
+                        while (HeroineActionBridge.IsGameVoiceBusy() &&
+                               Time.realtimeSinceStartup < blipDeadline)
+                        {
+                            _lastChainTick = Time.realtimeSinceStartup;
+                            yield return null;
+                        }
 
-                if (!ResumeAfterShortCut(clip, line, ref elapsed, ref speaking))
+                        if (HeroineActionBridge.IsGameVoiceBusy() || resumes >= MaxResumesPerLine)
+                        {
+                            Interrupt();
+                            yield break;
+                        }
+                    }
+
+                    if (!ResumeAfterShortCut(clip, line, ref elapsed, ref speaking))
+                    {
+                        Interrupt();
+                        yield break;
+                    }
+
+                    resumes++;
+                    mouthDeadline = Time.realtimeSinceStartup + clip.length + 1f;
+                }
+                else if (!independent)
                 {
+                    // 没抓到"游戏刚出声"，但我们的音频确实没了：按老办法收工
                     Interrupt();
                     yield break;
                 }
@@ -1480,6 +1630,22 @@ internal sealed class VoiceManager
             return true;
 
         return hour >= line.HourFrom && hour < line.HourTo;
+    }
+
+    /// <summary>
+    /// 当前时段。规则抄的是游戏自己的 Bulbul.TimeOfDayProvider.GetCurrentTimeOfDayType()：
+    /// 5 &lt; h &lt; 11 早上 / 11 &lt;= h &lt; 17 中午 / 17 &lt;= h &lt; 20 傍晚 / 其余晚上。
+    /// （那个方法内部也是读 DateTime.Now.Hour，所以两边本来就该完全一致。）
+    /// </summary>
+    private static string PhaseFromClock(int hour)
+    {
+        if (hour > 5 && hour < 11)
+            return "Morning";
+        if (hour >= 11 && hour < 17)
+            return "Noon";
+        if (hour >= 17 && hour < 20)
+            return "Evening";
+        return "Night";
     }
 
     /// <summary>把 "0.08-1.24;1.62-3.05" 解析成 start,end,start,end… 的扁平数组。</summary>

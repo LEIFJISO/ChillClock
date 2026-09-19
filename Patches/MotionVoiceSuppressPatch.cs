@@ -26,12 +26,24 @@ internal static class MotionVoiceSuppressPatch
         if (Time.realtimeSinceStartup >= SpeakingUntil)
             return true;
         if (!__0.StartsWith("Motion_", StringComparison.OrdinalIgnoreCase))
+        {
+            // 我们说话期间她自己开口（台词 / 自言自语）：记一条名字，方便事后对照
+            LogOnce("她自己开口: " + __0);
             return true;
+        }
 
+        LogOnce("拦掉动作音: " + __0);
         return false;   // 我们正在说话：这条动作附带音不播
     }
 
     private static readonly System.Collections.Generic.HashSet<string> _logged = new();
+
+    /// <summary>同一条语音只写一次日志，免得刷屏。</summary>
+    private static void LogOnce(string message)
+    {
+        if (_logged.Add(message))
+            Plugin.Log.LogInfo("[Chill Clock] 游戏语音 · " + message);
+    }
 
     /// <summary>
     /// 给 MotionSoundController 那些"动作自带的声音"用的通用 Prefix：

@@ -24,13 +24,16 @@ internal static class FocusWhitelistSetupPatch
 ///
 /// 游戏的 HeroineVoiceController.PlayVoice 一上来就 VoiceManager.Stop()，那一下会把它
 /// 管理的所有 voice player 一起停掉 —— 我们的语音是借它播的，也会被掐掉一半。
-/// 与其让它掐一半（音频断了、字幕还挂着、连播的第二句还接着念），不如我们主动停。
+///
+/// 但动作自带的小声音（看书时的嗯声、翻页、呼呼吹气）也走这条路，一律"整段作废"
+/// 就是用户遇到的"讲到一半被嗯声掐掉、而且再也不接上"。所以这里只通知一声：
+/// 由 VoiceManager 看这条声音响多久 —— 短的把我们这句重放一遍，长的（她的台词）让路。
 /// </summary>
 internal static class HeroineVoicePatch
 {
     private static void Prefix()
     {
-        Plugin.Instance?.AbortVoiceForGameLine();
+        Plugin.Instance?.NotifyGameVoiceStarted();
     }
 }
 

@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-public const string Version = "0.9.0";
+public const string Version = "0.9.1";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -59,7 +59,6 @@ public const string Version = "0.9.0";
     private bool _pendingRestVoice;
     private float _nextAmbientVoiceTime;
     private float _nextIdleTalkTime;
-    private bool _testBeetleDone;   // 临时测试用（测完删掉）
     private float _nextRestChatTime;
     private float _voiceGraceUntil;
 
@@ -203,7 +202,10 @@ public const string Version = "0.9.0";
                                     "PlayGutsVoice", "PlayJumpUpStartVoice", "PlayJumpUpEndVoice",
                                     "PlayStretchStartVoice", "PlayStretchEndVoice",
                                     "PlayInterestVoice", "PlayQuestionVoice", "PlayThinkingVoice",
-                                    "PlayUnderstandVoice", "PlayDropPenVoice", "PlayHandClap" };
+                                    "PlayUnderstandVoice", "PlayDropPenVoice", "PlayHandClap",
+                                    // 笑出声那一条也是走语音系统的动作音：我们说话期间不该响
+                                    //（不然又会把我们的整句掐断一次）
+                                    "PlayLaughVoice" };
                 var motionPatched = 0;
                 foreach (var name in names)
                 {
@@ -734,6 +736,23 @@ public const string Version = "0.9.0";
         }
     }
 
+    /// <summary>
+    /// 游戏那边有人开口（HeroineAI.PlayVoice）。**不**立刻把我们的整段作废 ——
+    /// 看书时的嗯声、翻页、呼呼吹气这些小声音也走这条路，直接作废就是
+    /// "讲到一半被嗯声掐掉、而且再也不接上"。交给 VoiceManager 按声音长短判定。
+    /// </summary>
+    internal void NotifyGameVoiceStarted()
+    {
+        try
+        {
+            _voiceManager?.NotifyGameVoiceStarted();
+        }
+        catch (Exception e)
+        {
+            Logger.LogWarning("[Chill Clock] notify game voice failed: " + e.Message);
+        }
+    }
+
     internal void AttachPomodoroService(Bulbul.PomodoroService service)
     {
         _pomodoroServiceInstance = service;
@@ -839,20 +858,7 @@ public const string Version = "0.9.0";
             ? "Work"
             : (IsPomodoroSessionActive() ? "Break" : "Normal");
 
-        // ===== 临时测试用（测完删掉）=====
-        // 非专注时：第一次点她一定播「トゲアリ トゲナシ トゲハムシ」那段，
-        // 之后每次点击都从这一批小课堂里随机抽，方便连着测动作/语音。
-        VoiceStartResult result;
-        if (!_focusActive)
-        {
-            // 测试用的"按顺序播故事"已经删掉，回到正常：从点击池里随机抽。
-            result = _voiceManager.PlayClick(state);
-        }
-        else
-        {
-            result = _voiceManager.PlayClick(state);
-        }
-        // ===== 临时测试用结束 =====
+        var result = _voiceManager.PlayClick(state);
         if (result == VoiceStartResult.Started)
         {
             return ClickReactionResult.TakeOver;
