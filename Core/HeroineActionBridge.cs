@@ -131,6 +131,112 @@ internal static class HeroineActionBridge
     /// <summary>这一句台词我们动过她的表情/视线吗（说完要收拾干净）。</summary>
     private static bool _lineTouchedLook;
     private static bool _lineTouchedFacial;
+    private static float _lastScenarioLook = -1f;   // 上一次给剧情式台词设过的视线值
+    private static float _nextLookResetCheck;
+
+    /// <summary>她这会儿正在端杯子喝水（动作段 740-780）。</summary>
+    public static bool IsDrinkingNow()
+    {
+        var anim = GetCurrentAnimationType();
+        return anim >= 740 && anim < 780;
+    }
+
+    // ===== 自言自语（她那套"自发闲聊 + 动作小声音"）的开关 =====
+    // 游戏里由 HeroineSelfTalkController 管，里面有个 _selfTalkProbability（0 = 完全不发自言自语）。
+    // 我们念台词期间把它按成 0，说完再还原 —— 比事后拦声音干净。
+    private static int _savedSelfTalkProbability = -1;
+
+    public static void SuppressSelfTalk(bool suppress)
+    {
+        try
+        {
+            var ai = _heroineAi;
+            if (ai == null)
+                return;
+
+            var fCtrl = ai.GetType().GetField("_selfTalkController",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            var ctrl = fCtrl?.GetValue(ai);
+            if (ctrl == null)
+                return;
+
+            var fProb = ctrl.GetType().GetField("_selfTalkProbability",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (fProb == null || fProb.FieldType != typeof(int))
+                return;
+
+            if (suppress)
+            {
+                if (_savedSelfTalkProbability < 0)
+                    _savedSelfTalkProbability = (int)fProb.GetValue(ctrl);
+                fProb.SetValue(ctrl, 0);
+            }
+            else if (_savedSelfTalkProbability >= 0)
+            {
+                fProb.SetValue(ctrl, _savedSelfTalkProbability);
+                _savedSelfTalkProbability = -1;
+            }
+        }
+        catch (Exception e)
+        {
+            Plugin.Log.LogWarning("[Chill Clock] 自言自语开关失败: " + e.Message);
+        }
+    }
+
+    /// <summary>她当前动作段的数值（诊断用）。</summary>
+    public static int CurrentAnimationId() => GetCurrentAnimationType();
+
+    /// <summary>因为喝水把视线收回去之前，先记下原本想说的时候要看哪边（喝完再转回来）。</summary>
+    private static float _lookBeforeDrink = -1f;
+
+    /// <summary>
+    /// 她开始做"别的动作"（起身、喝茶、看书、开窗…）时把视线收回去 ——
+    /// 一边看着你一边喝水的样子很怪。只在桌前干活（17/18/19）时保留"看着你"。
+    /// </summary>
+    public static void ResetLookIfActionStarted()
+    {
+        if (_lastScenarioLook <= 0.01f)
+            return;
+
+        // 注意：不要在这里加"只在我们说话时才检查"的优化 —— 试过，
+        // 结果是"她已经端起杯子了我们才开始处理"，看着还是边喝边说。
+        // 这个检查必须一直跑（0.25 秒节流，开销本来就很小）。
+
+        // 我们正在念这句的时候不要去动她的视线：她在"转头看你"转到一半，
+        // 我们这边又判成"该收回去"，就变成转一半立刻弹回去（用户看到的就是这个）。
+        // 只在她两句之间、或者我们没在说话时才收。
+        if (Time.realtimeSinceStartup < UI.MotionVoiceSuppressPatch.SpeakingUntil)
+            return;
+
+        var now = Time.realtimeSinceStartup;
+        if (now < _nextLookResetCheck)
+            return;
+        _nextLookResetCheck = now + 0.25f;
+
+        var anim = GetCurrentAnimationType();
+        var drinking = anim >= 740 && anim < 780;
+
+        if (!drinking)
+        {
+            // 喝完水了：如果刚才因为我们喝水把视线收了，这里再转回来
+            if (_lookBeforeDrink > 0.01f && Time.realtimeSinceStartup >= _nextLookResetCheck)
+            {
+                _nextLookResetCheck = Time.realtimeSinceStartup + 0.25f;
+                SetLookScale(_lookBeforeDrink);
+                _lastScenarioLook = _lookBeforeDrink;
+                _lineTouchedLook = true;
+                _lookBeforeDrink = -1f;
+            }
+            return;
+        }
+
+        // 喝水这一个是特殊照顾的：端起杯子 → 头转回去，喝完再转回来。
+        _lookBeforeDrink = _lastScenarioLook;
+
+        SetLookScale(0f);
+        _lastScenarioLook = 0f;
+        _lineTouchedLook = true;
+    }
     private static MethodInfo _isGameEndDirection;
 
     private static MonoBehaviour _clickHeroine;
@@ -407,6 +513,50 @@ internal static class HeroineActionBridge
         return InvokeServiceFlag("IsPossibleClickHeroineReaction");
     }
 
+    /// <summary>FacilityClickHeroine._mainState 的名字（诊断用，日志里一眼看清她在什么状态）。</summary>
+    public static string ClickMainStateName()
+    {
+        var state = GetClickMainState();
+        return state < 0 ? "?" : state + "(" + MainStateName(state) + ")";
+    }
+
+    private static string MainStateName(int state)
+    {
+        // 游戏自己的枚举顺序（FacilityClickHeroine.MainState）
+        switch (state)
+        {
+            case 0: return "None";
+            case 1: return "Idle";
+            case 2: return "Wait";
+            case 3: return "Story";
+            default: return "其它";
+        }
+    }
+
+    /// <summary>
+    /// 游戏自己是不是"这会儿正准备播它那段剧情/反应"（FacilityClickHeroine.IsReactionStartReady）。
+    /// 是的话我们要让路：那种时候点她，该出来的是游戏自己的剧情，
+    /// 而不是我们的扩充台词。
+    /// </summary>
+    public static bool IsGameClickScenarioReady()
+    {
+        if (!EnsureClickHeroine())
+            return false;
+
+        try
+        {
+            var method = _clickHeroine.GetType().GetMethod("IsReactionStartReady", Instance);
+            if (method == null)
+                return false;
+            var value = method.Invoke(_clickHeroine, null);
+            return value is bool ready && ready;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>
     /// 接管这次点击反应：播放我们池子里的台词。
     /// 返回 true 表示已经接管（调用方跳过游戏原本的反应流程）。
@@ -512,6 +662,39 @@ internal static class HeroineActionBridge
     /// 只改头部和眼神的权重，身体动画照旧，所以她还在敲键盘、翻书、写字，
     /// 只是转过头来跟你说话 —— 就是"一边干活一边回头"。
     /// </summary>
+    /// <summary>
+    /// 把视线**固定**在一个值上（0 = 看着别处，1 = 看着你），不做跟随。
+    /// 剧情和小课堂就是这么做的：NovelData.LookScale 给一个数，设一次就不动。
+    /// </summary>
+    public static void SetLookScale(float scale)
+    {
+        try
+        {
+            if (EnsureService() == null || _changeLook == null)
+                return;
+
+            // 游戏这个方法的签名是 (float scale, float seconds, DG.Tweening.Ease ease) ——
+            // 以前只传了一个参数，Invoke 直接抛异常（而且异常里还把 _changeLook 置空了，
+            // 于是"要看屏幕"的台词全都没反应）。这里按真实签名传三个。
+            var ps = _changeLook.GetParameters();
+            if (ps.Length >= 3)
+            {
+                // 时长用游戏自己的值（NovelData.LookSpeedSeconds 通常是 1.0 秒）——
+                // 之前 0.4 秒转得太快，看着吓人。
+                var ease = Enum.Parse(ps[2].ParameterType, "OutQuad");
+                _changeLook.Invoke(_service, new[] { (object)scale, 1.0f, ease });
+            }
+            else
+            {
+                _changeLook.Invoke(_service, new object[] { scale });
+            }
+        }
+        catch (Exception e)
+        {
+            Plugin.Log.LogWarning("[Chill Clock] look scale failed: " + e.Message);
+        }
+    }
+
     public static void SetLookAtPlayer(bool look)
     {
         if (!Enabled || IsGameSequenceBusy())
@@ -554,7 +737,8 @@ internal static class HeroineActionBridge
     /// gestureChancePercent 由调用方按池子给：提醒类台词（走神/任务管理器/退出）一律 0。
     /// 返回值表示这次有没有动过她的视线（调用方负责说完再放回去）。
     /// </summary>
-    public static bool Play(string emotion, bool isClickReaction, bool setLook, int gestureChancePercent)
+    public static bool Play(string emotion, bool isClickReaction, bool setLook, int gestureChancePercent,
+                            string action = null)
     {
         if (!Enabled || IsGameSequenceBusy())
             return false;
@@ -562,8 +746,81 @@ internal static class HeroineActionBridge
         // ActionStateType 17/18/19 = WorkPC / WorkBook / WorkReport，也就是"在桌前干活"
         var atDesk = IsWorkingAtDesk();
 
-        if ((atDesk || isClickReaction) && gestureChancePercent > 0 && Rng.Next(100) < gestureChancePercent)
-            PlayGesture(emotion);
+        // 目录里配了动作的（小课堂那批）照剧情走：剧情里她说话该转身就转身、
+        // 该换姿势就换姿势，不会"一边干活一边回头跟你说话"。
+        // 那批台词本来就只在她不专注 / 休息时说，所以不受"桌前工作优先"那套限制。
+        var scenarioLike = !string.IsNullOrEmpty(action);
+
+        if (scenarioLike)
+        {
+            // 目录里给的是剧情那套数值："body:face:look"，-1 = 保持现状。
+            // 照抄游戏 SmallTalk 的做法：多数句子 body=-1、look=0（安静坐着、不转头），
+            // 少数才动身体 / 换表情 / 看你。这里就是按这三个数办事，不做随机。
+            var parts = action.Split(':');
+            if (parts.Length >= 3 &&
+                int.TryParse(parts[0], out var body) &&
+                int.TryParse(parts[1], out var face) &&
+                float.TryParse(parts[2], System.Globalization.NumberStyles.Float,
+                               System.Globalization.CultureInfo.InvariantCulture, out var look))
+            {
+                // 身体动作**只在连播的第一句**做：每一句都设一次，她会把同一个动作
+                // 从头做一遍 —— 看着就是"反复拿起书、放下书"。setLook 正好代表
+                // "这是连播的第一句"（调用方只在第一句传 true）。
+                // 连播第一句一定做；后面的句子只在"笑 / 惊叹"这类**表情型小动作**时做。
+                // 桌面型动作（750 / 1200 / 200…）每句重做一次就会变成"反复拿起书放下书"。
+                // 剧情里的"说话手势"（Story_SubBase，1001-1302）在连播中间也照做；
+                // 1200/750/200 那种带场景音效的动作只在第一句做。
+                var expressive = (body >= 1000 && body < 1400) ||
+                                 body == 12 || body == 3 || body == 6 || body == 8 ||
+                                 body == 9 || body == 14;
+                if (body >= 0 && (setLook || expressive) && EnsureService() != null && _changeAnimation != null)
+                {
+                    try
+                    {
+                        _changeAnimation.Invoke(_service, new object[] { body });
+                    }
+                    catch (Exception e)
+                    {
+                        Plugin.Log.LogWarning("[Chill Clock] body motion failed: " + e.Message);
+                    }
+                }
+
+                // 表情只在她本来就自然的档位上换（1=微笑 / 2 / 5=笑），
+                // 12、13 那种是剧情演出用的夸张表情，长时间挂着会出现
+                // "眼睛闭着不睁"这种怪状态 —— 所以这里过滤掉。
+                if (face == 1 || face == 2 || face == 5)
+                {
+                    ChangeFacial(face);
+                    _lineTouchedFacial = true;
+                }
+
+                // 视线：只有"邀请互动"那种句子才需要看屏幕（look=1），其余一律不碰。
+                // 而且只在**数值真的变了**的时候设一次 —— 每句都设同样的值会让她的头
+                // 一句一回正，看着像左右扭个不停（这就是之前的毛病）。
+                // 端着杯子/拿着书**也要转头看你**（用户要求：说话时就该看着你）。
+                // 之前这里跳过"端杯子"的情况，结果她端着杯子讲半天都不回头。
+                if (look > 0.01f && Mathf.Abs(look - _lastScenarioLook) > 0.01f)
+                {
+                    SetLookScale(look);
+                    _lastScenarioLook = look;
+                    _lineTouchedLook = true;
+                }
+                else if (look <= 0.01f && _lastScenarioLook > 0.01f)
+                {
+                    // 互动结束，视线放回去
+                    SetLookScale(look);
+                    _lastScenarioLook = look;
+                    _lineTouchedLook = true;
+                }
+
+                return true;
+            }
+        }
+        else if ((atDesk || isClickReaction) &&
+                 gestureChancePercent > 0 && Rng.Next(100) < gestureChancePercent)
+        {
+            PlayGesture(emotion, null);
+        }
 
         if (emotion != null && EmotionFacials.TryGetValue(emotion, out var facial))
         {
@@ -571,10 +828,20 @@ internal static class HeroineActionBridge
             _lineTouchedFacial = true;
         }
 
-        if (!setLook || (!atDesk && !isClickReaction))
+        if (!setLook || (!atDesk && !isClickReaction && !scenarioLike))
             return false;
 
-        SetLookAtPlayer(true);
+        if (scenarioLike)
+        {
+            // 剧情/小课堂那套：视线是**一个固定值**（游戏里由 NovelData.LookScale 给定，
+            // CommandChangeMotion 设一次就不动了）。用 LookAt 跟随玩家/鼠标会让她的
+            // 眼神一直飘 —— 剧情里不是这样。
+            SetLookScale(1f);
+        }
+        else
+        {
+            SetLookAtPlayer(true);
+        }
         _lineTouchedLook = true;
         return true;
     }
@@ -635,15 +902,27 @@ internal static class HeroineActionBridge
     /// 播放一个情绪对应的身体动作。会把她手头的活打断（换到别的动作段），
     /// 所以只在少数时候用（走神/任务管理器/退出这几个池子完全不碰）。
     /// </summary>
-    private static void PlayGesture(string emotion)
+    private static void PlayGesture(string emotion, string action = null)
     {
         int[] ids = null;
 
         // 她离席、睡着了的时候不在桌前，动身体只会更奇怪：只动嘴和表情
         if (!InvokeServiceFlag("IsLeaveChair") && !InvokeServiceFlag("IsSleeping"))
         {
+            // 目录里给这一句写了动作就用它（台词本身挑的，比按情绪随机更贴合内容）：
+            //   数字   = AnimationType 的 id，直接播
+            //   名字   = EmotionAnimations 里的键（Happy / Think / Curious …）
+            if (!string.IsNullOrEmpty(action))
+            {
+                if (int.TryParse(action.Trim(), out var explicitId))
+                    ids = new[] { explicitId };
+                else if (EmotionAnimations.TryGetValue(action.Trim(), out var byAction))
+                    ids = byAction;
+            }
+
             // 场景对得上就用她当前那一套里的桌面子动作；没有就用手势
-            ids = SceneAnimations();
+            if (ids == null)
+                ids = SceneAnimations();
             if (ids == null && EmotionAnimations.TryGetValue(emotion ?? "Idle", out var byEmotion))
                 ids = byEmotion;
         }

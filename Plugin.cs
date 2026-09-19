@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-    public const string Version = "0.8.5";
+public const string Version = "0.9.0";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -58,6 +58,8 @@ public sealed class Plugin : BaseUnityPlugin
     private bool _pendingExitVoice;
     private bool _pendingRestVoice;
     private float _nextAmbientVoiceTime;
+    private float _nextIdleTalkTime;
+    private bool _testBeetleDone;   // 临时测试用（测完删掉）
     private float _nextRestChatTime;
     private float _voiceGraceUntil;
 
@@ -174,12 +176,55 @@ public sealed class Plugin : BaseUnityPlugin
                 _harmony.Patch(reactionReady, prefix: PatchMethod("ClickReactionPatch", "Prefix"));
 
             // 游戏自己要开口时先让我们闭嘴（HeroineAI 在全局命名空间，只能按名字找）
+            // 我们念台词期间，拦掉游戏"挂在动作上的小声音"（喝咖啡呼呼 / 看书嗯声）——
+            // 这些都从 HeroineVoiceController.PlayVoice 出去，名字前缀是 Motion_。
+            var voiceController = AccessTools.TypeByName("HeroineVoiceController");
+            var controllerPlay = voiceController == null
+                ? null
+                : AccessTools.Method(voiceController, "PlayVoice",
+                    new[] { typeof(string), typeof(bool), typeof(bool) });
+            if (controllerPlay != null)
+                _harmony.Patch(controllerPlay, prefix: PatchMethod("MotionVoiceSuppressPatch", "Prefix"));
+            else
+                Log.LogWarning("[Chill Clock] 没找到 HeroineVoiceController.PlayVoice，动作音拦截没挂上");
+
+            // 那些声音其实是从 MotionSoundController 出来的（它管"动作自带的声音"）：
+            // 喝东西吹气"呼呼"、端杯子、翻页(看书/翻小说)…我们说话期间一律不播。
+            // 用户实测过：关掉它就会被"看书时的嗯声"打断且接不回来，所以重新打开，
+            // 并且把剩下的动作声音（打气握拳、蹦起来、伸懒腰、思考/疑问那几句）也一起挂上。
+            const bool enableMotionSoundSuppress = true;
+            var motionSound = enableMotionSoundSuppress ? AccessTools.TypeByName("MotionSoundController") : null;
+            if (motionSound != null)
+            {
+                var names = new[] { "PlayDrinkToCoolVoice", "PlayDrinkToCoolVoice_2", "PlayDrinkHotVoice",
+                                    "NovelFlipPage", "TextbookFlipPage",
+                                    "PlayCupSoundForPlacing", "PlayCupSoundAfterDrinking",
+                                    "PlayCupSoundForSmallMovement", "PlayCupSoundForStrongMovement",
+                                    "PlayGutsVoice", "PlayJumpUpStartVoice", "PlayJumpUpEndVoice",
+                                    "PlayStretchStartVoice", "PlayStretchEndVoice",
+                                    "PlayInterestVoice", "PlayQuestionVoice", "PlayThinkingVoice",
+                                    "PlayUnderstandVoice", "PlayDropPenVoice", "PlayHandClap" };
+                var motionPatched = 0;
+                foreach (var name in names)
+                {
+                    var method = AccessTools.Method(motionSound, name);
+                    if (method == null)
+                        continue;
+                    _harmony.Patch(method, prefix: PatchMethod("MotionVoiceSuppressPatch", "SimplePrefix"));
+                    motionPatched++;
+                }
+                Log.LogInfo("[Chill Clock] 动作声音拦截已挂 " + motionPatched + " 个方法");
+            }
+            else
+                Log.LogWarning("[Chill Clock] 没找到 MotionSoundController");
+
             var heroineAiType = AccessTools.TypeByName("HeroineAI");
             var playVoice = heroineAiType == null
                 ? null
                 : AccessTools.Method(heroineAiType, "PlayVoice", new[] { typeof(string), typeof(bool), typeof(bool) });
             if (playVoice != null)
                 _harmony.Patch(playVoice, prefix: PatchMethod("HeroineVoicePatch", "Prefix"));
+
             else
                 Logger.LogWarning("HeroineAI.PlayVoice not found; 游戏开口时不会主动让路");
 
@@ -235,7 +280,23 @@ public sealed class Plugin : BaseUnityPlugin
             IsPomodoroSessionActive());
         ProcessVoiceReminders();
         TickAmbientVoice();
+        // ===== 临时调试（用完删掉）：启动 30 秒后把游戏的 MasterData 导一份出来 =====
+        if (Time.realtimeSinceStartup > 30f)
+            Core.MasterDataDump.DumpOnce(Logger);
+
         HeroineActionBridge.Enabled = _heroineReactions.Value;
+        // 她端起杯子喝水时把视线收回去、喝完再转回来。
+        //
+        // 上一版这里没有 try/catch，运行时一旦抛异常，BepInEx 会把这个插件整个停掉 ——
+        // 表现就是"点击完全没反应"（所有补丁都不在了）。所以：
+        //   1) 外面裹 try/catch，异常绝不允许冒到 Update 之外
+        //   2) 内部有 0.25 秒节流，不是每帧都做重活
+        // 喝水相关的特殊处理**已全部删除**（用户要求）。
+        //
+        // 之前试过两版：一是"她喝水就把视线收回去、喝完再转回来"，二是"她喝水时
+        // 我们的台词先等着"。前者会让端着杯子时点不动（视线补间动画占住了游戏的
+        // 点击反应），后者会让连播卡在等待里、点击全程失效。都不划算，删掉。
+        // 现在喝水就是游戏自己的行为，我们只保持"说话时转头看你"这一条通用逻辑。
         TickCoreHost();
     }
 
@@ -268,6 +329,7 @@ public sealed class Plugin : BaseUnityPlugin
         if (_focusActive)
         {
             _nextRestChatTime = 0f;
+            _nextIdleTalkTime = 0f;
 
             // 自言自语关掉了：不推进计时器，等下次打开时重新计时
             if (!chatInFocus)
@@ -292,6 +354,7 @@ public sealed class Plugin : BaseUnityPlugin
         if (IsPomodoroSessionActive())
         {
             _nextAmbientVoiceTime = 0f;
+            _nextIdleTalkTime = 0f;
 
             if (!chatInBreak)
             {
@@ -307,15 +370,37 @@ public sealed class Plugin : BaseUnityPlugin
             if (now >= _nextRestChatTime)
             {
                 _nextRestChatTime = now + UnityEngine.Random.Range(2f, 4f) * 60f;
-                _voiceManager.PlayRestReminder();
+                // 休息时一半是小课堂那种闲聊，一半还是原来的休息提醒
+                if (chatInBreak && UnityEngine.Random.value < 0.5f)
+                    _voiceManager.PlayBreakTalk();
+                else
+                    _voiceManager.PlayRestReminder();
             }
             return;
         }
 
-        // 既不在专注也不在休息：一句都不说。
-        // 顺手把计时器清零，免得下次进入专注时因为计时器早就过期而立刻开口。
+        // 既不在专注也不在休息 = 待机。
+        // 这里放小课堂那段闲聊（用户要在非专注时也能听到），间隔比专注时短一些。
         _nextRestChatTime = 0f;
         _nextAmbientVoiceTime = 0f;
+
+        if (!chatInFocus)
+        {
+            _nextIdleTalkTime = 0f;
+            return;
+        }
+
+        if (_nextIdleTalkTime <= 0f)
+        {
+            _nextIdleTalkTime = now + 5f * 60f;
+            return;
+        }
+
+        if (now >= _nextIdleTalkTime)
+        {
+            _nextIdleTalkTime = now + UnityEngine.Random.Range(7f, 12f) * 60f;
+            _voiceManager.PlayIdleTalk();
+        }
     }
 
     private void OnWindowMinimized(string processName, bool isTaskManager)
@@ -720,18 +805,54 @@ public sealed class Plugin : BaseUnityPlugin
 
         // 只接管"玩家点击"，不碰她自发的 HeroineSelf
         if (reactionType != Bulbul.FacilityClickHeroine.ReactionType.Click)
+        {
+            // 例外：她自发的自言自语会走游戏的 VoiceManager.Stop()，把我们的音频
+            // 一起掐断（用户听到的就是"我们的台词讲到一半被她的自言自语打断"）。
+            // 我们正在念的时候先把这类反应压住；我们说完了它自然会照常。
+            if (reactionType == Bulbul.FacilityClickHeroine.ReactionType.HeroineSelf &&
+                _voiceManager.IsBusy)
+            {
+                return ClickReactionResult.TakeOver;
+            }
+
             return ClickReactionResult.PassThrough;
+        }
 
         if (!HeroineActionBridge.CanTakeOverClickReaction())
         {
             return ClickReactionResult.PassThrough;
         }
 
+        // 游戏这会儿有剧情等着触发（它的点击反应已经就绪）：让路，
+        // 让玩家点到的是**游戏自己的剧情**，而不是我们的扩充台词。
+        Logger.LogInfo("[Chill Clock] 点击诊断: mainState=" + HeroineActionBridge.ClickMainStateName() +
+                       " reactionStartReady=" + HeroineActionBridge.IsGameClickScenarioReady() +
+                       " possible=" + HeroineActionBridge.IsPossibleClickReaction() +
+                       " free=" + HeroineActionBridge.IsClickReactionFree() +
+                       " seqBusy=" + HeroineActionBridge.IsGameSequenceBusy() +
+                       " voiceBusy=" + HeroineActionBridge.IsGameVoiceBusy());
+        // 注意：这里**不要**再拿"游戏剧情是否就绪"来拦我们的点击。
+        // 之前加过一版，结果 `IsReactionStartReady` 在平时也是 true ——
+        // 于是点击全被让路，玩家点她再也没反应。要拦"剧情待触发"得换判据。
+
         var state = _focusActive
             ? "Work"
             : (IsPomodoroSessionActive() ? "Break" : "Normal");
 
-        var result = _voiceManager.PlayClick(state);
+        // ===== 临时测试用（测完删掉）=====
+        // 非专注时：第一次点她一定播「トゲアリ トゲナシ トゲハムシ」那段，
+        // 之后每次点击都从这一批小课堂里随机抽，方便连着测动作/语音。
+        VoiceStartResult result;
+        if (!_focusActive)
+        {
+            // 测试用的"按顺序播故事"已经删掉，回到正常：从点击池里随机抽。
+            result = _voiceManager.PlayClick(state);
+        }
+        else
+        {
+            result = _voiceManager.PlayClick(state);
+        }
+        // ===== 临时测试用结束 =====
         if (result == VoiceStartResult.Started)
         {
             return ClickReactionResult.TakeOver;

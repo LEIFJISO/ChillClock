@@ -371,10 +371,30 @@ internal sealed class VoiceManager
     }
 
     public VoiceStartResult PlayDistraction() => Play("Distraction", 3f);
+
+    /// <summary>我们这会儿正在念台词（连播中或音频还在响）。</summary>
+    public bool IsBusy => _chainRunning || (_source != null && _source.isPlaying);
     public VoiceStartResult PlayTaskManager() => Play("TaskManager", 4f);
     public VoiceStartResult PlayExitAttempt() => Play("Exit", 4f);
     public VoiceStartResult PlayRestReminder() => Play("Rest", 30f);
     public VoiceStartResult PlayAmbient() => Play("Ambient", 45f);
+
+    /// <summary>非专注（既不专注也不休息）时的自言自语：小课堂那种连着讲几句的段落。</summary>
+    public VoiceStartResult PlayIdleTalk() => Play("IdleTalk", 90f);
+
+    /// <summary>休息时的闲聊：同样是小课堂段落，和"休息提醒"分开两个池子。</summary>
+    public VoiceStartResult PlayBreakTalk() => Play("BreakTalk", 90f);
+
+    // ===== 临时测试用（测完删掉）=====
+    // 非专注时第一次点击：强制播「トゲアリ トゲナシ トゲハムシ」那一段（开场是 Satone_0304）。
+    public VoiceStartResult PlayTestBeetle() => Play("IdleTalk", 0f, "Satone_0304.ogg");
+
+    // 之后的点击：从小课堂这一批里随机抽（同一个池子，但冷却缩短到 2 秒方便连着点）。
+    public VoiceStartResult PlayTestBatch() => Play("IdleTalk", 2f);
+
+    /// <summary>测试用：强制播指定开头的那一段（传该段第一句的文件名）。</summary>
+    public VoiceStartResult PlayTestStory(string firstFile) => Play("IdleTalk", 2f, firstFile);
+    // ===== 临时测试用结束 =====
 
     /// <summary>
     /// 点击聪音时的反应台词。state 取 Work / Break / Normal，
@@ -388,7 +408,7 @@ internal sealed class VoiceManager
         return result;
     }
 
-    private VoiceStartResult Play(string trigger, float cooldown)
+    private VoiceStartResult Play(string trigger, float cooldown, string forced = null)
     {
         if (_source == null || _runner == null)
         {
@@ -469,7 +489,7 @@ internal sealed class VoiceManager
             return VoiceStartResult.Deferred;
         }
 
-        var start = Pick(pool);
+        var start = string.IsNullOrEmpty(forced) ? Pick(pool) : forced;
         if (start == null)
         {
             return VoiceStartResult.Skipped;
@@ -551,7 +571,42 @@ internal sealed class VoiceManager
         return true;
     }
 
+    /// <summary>
+    /// 从池子里抽一条。用户设定的两条规则在这里：
+    ///   1) 池子里既有"我们的故事"又有原本的台词时，我们的占 30%
+    ///   2) 不要连续两段都抽到同一个故事
+    /// </summary>
     private string Pick(List<string> pool)
+    {
+        var ours = new List<string>();
+        var theirs = new List<string>();
+        foreach (var file in pool)
+        {
+            if (file.StartsWith("Satone_", StringComparison.OrdinalIgnoreCase))
+                ours.Add(file);
+            else
+                theirs.Add(file);
+        }
+
+        var useOurs = ours.Count > 0 && (theirs.Count == 0 || UnityEngine.Random.value < 0.30f);
+        var source = useOurs ? ours : theirs;
+        if (source.Count == 0)
+            source = pool;
+
+        var picked = PickByTime(source);
+
+        // 不要连着两段同一个故事（只在"我们的池子"里避让）
+        if (useOurs && ours.Count > 1 && picked == _lastPlayed)
+        {
+            var again = PickByTime(ours);
+            if (!string.IsNullOrEmpty(again))
+                picked = again;
+        }
+
+        return picked;
+    }
+
+    private string PickByTime(List<string> pool)
     {
         if (pool.Count == 0)
             return null;
@@ -608,8 +663,16 @@ internal sealed class VoiceManager
             return festival.Count > 0 ? festival[UnityEngine.Random.Range(0, festival.Count)] : null;
 
         pool = regular;
+
+        var neutral = new List<string>();
+        foreach (var file in pool)
+        {
+            if (_catalog.TryGetValue(file, out var line) && string.IsNullOrEmpty(line.Time))
+                neutral.Add(file);
+        }
+
         var now = timeOfDay;
-        if (!string.IsNullOrEmpty(now))
+        if (!string.IsNullOrEmpty(now) && neutral.Count > 0)
         {
             var matches = new List<string>();
             foreach (var file in pool)
@@ -622,15 +685,11 @@ internal sealed class VoiceManager
                 }
             }
 
-            if (matches.Count > 0)
+            // 时段专属台词只是"多一次中签机会"，不能把中性台词全挡掉。
+            // 以前这里只要有时段专属就直接返回它们，而每个时段只有八九句 ——
+            // 结果一整段时间里翻来覆去就那几句，池子里四百多条等于没用到。
+            if (matches.Count > 0 && UnityEngine.Random.value < 0.2f)
                 return matches[UnityEngine.Random.Range(0, matches.Count)];
-        }
-
-        var neutral = new List<string>();
-        foreach (var file in pool)
-        {
-            if (_catalog.TryGetValue(file, out var line) && string.IsNullOrEmpty(line.Time))
-                neutral.Add(file);
         }
 
         var source = neutral.Count > 0 ? neutral : pool;
@@ -640,6 +699,9 @@ internal sealed class VoiceManager
     private IEnumerator PlayChain(List<string> files)
     {
         _chainRunning = true;
+        // 我们讲这一段期间，把她"自发的自言自语"关掉（包括跟着动作出来的小声音），
+        // 讲完再还原 —— 比事后拦声音干净得多。
+        HeroineActionBridge.SuppressSelfTalk(true);
         _lastChainTick = Time.realtimeSinceStartup;
         _chainStartedAt = Time.realtimeSinceStartup;
         try
@@ -652,11 +714,51 @@ internal sealed class VoiceManager
                 if (_abortRequested)
                     break;
 
-                // 游戏自己正在说话时开口，只会两边叠在一起：这句也一起放弃
-                if (!firstLine && IsGameVoiceBusySafe())
+                // 注意：这里**不要**再调 HeroineActionBridge.ResetLookIfActionStarted()。
+                //
+                // 原因（用户实测）：她端着杯子时点不动，拿走书/放下杯子就正常 ——
+                // 差异就是我们这段代码会调 SetLookScale。而游戏那个方法内部起了一个
+                // 视线补间动画，动画在跑的时候游戏的"点击反应是否空闲"就是 false，
+                // 于是我们的点击接管被判成不可接管 → 端着杯子时点她完全没反应。
+                //
+                // 所以喝水这块只保留"等她喝完再讲"（下面那段等待），不再碰视线。
+
+                // 注意：这里**不要**加"她喝水就等着"的循环。
+                //
+                // 用户实测：加了它之后，她端着杯子时点她完全没反应 —— 因为等待是在
+                // 连播里跑的，而连播期间我们的点击一律返回 Deferred（游戏那边显示
+                // 禁止光标）。"倒茶时间"这个状态又会持续好一阵，看起来就是点不动。
+                // 喝水这块只做视线处理（HeroineActionBridge.ResetLookIfActionStarted）。
+
+                // 游戏正在跑它自己的演出（开窗/关窗这类）：等它演完再讲。
+                // 那段时间字幕框整个归它管，我们硬说的话字幕会被收走（用户遇到的就是这个）。
+                // 等完再开口，字幕和语音就一起出现。最多等 12 秒，避免卡死。
+                var seqDeadline = Time.realtimeSinceStartup + 12f;
+                while (HeroineActionBridge.IsGameSequenceBusy() &&
+                       Time.realtimeSinceStartup < seqDeadline)
                 {
-                    Interrupt();
+                    _lastChainTick = Time.realtimeSinceStartup;
+                    yield return null;
+                }
+
+                if (_abortRequested)
                     break;
+
+                // 游戏自己开口了（它的 VoiceManager.Stop() 会把我们的音频一起掐断）：
+                // 以前这里直接把整段作废 —— 用户听到的就是"讲到一半突然断了"。
+                // 现在改成**等它说完再继续**，整段能一句不落地讲完。
+                if (IsGameVoiceBusySafe())
+                {
+                    // 最多等 3 秒：等太久她会僵在那儿，比断掉更怪。
+                    var waitUntil = Time.realtimeSinceStartup + 3f;
+                    while (IsGameVoiceBusySafe() && Time.realtimeSinceStartup < waitUntil)
+                    {
+                        _lastChainTick = Time.realtimeSinceStartup;
+                        yield return null;
+                    }
+
+                    if (_abortRequested)
+                        break;
                 }
 
                 RequestClip(file);
@@ -733,6 +835,9 @@ internal sealed class VoiceManager
             _chainStage = string.Empty;
             _chainStartedAt = 0f;
 
+            // 讲完了：把她自己的自言自语还回去
+            HeroineActionBridge.SuppressSelfTalk(false);
+
             // 不管中间怎么结束，都收拾干净：视线慢慢回正、表情复位
             HeroineActionBridge.EndLineReaction();
         }
@@ -745,9 +850,48 @@ internal sealed class VoiceManager
     /// 这里用离线算好的时间段（目录第 10 列）来管：说到哪一段就开嘴，空档就闭嘴。
     /// 没有分段信息的老语音包保持原来的行为（整条开着，结束前一点闭嘴）。
     /// </summary>
+    /// <summary>
+    /// 被"短的动作声音"（呼呼吹气、翻书嗯声…）掐断后：把这一句从头再放一遍，
+    /// 然后接着往下讲。她**自己**开口那种情况不在这里处理（调用方直接让路）。
+    /// </summary>
+    private bool ResumeAfterShortCut(AudioClip clip, VoiceLine line, ref float progress, ref bool speaking)
+    {
+        if (clip == null || line == null)
+            return false;
+
+        var name = Path.GetFileNameWithoutExtension(line.File);
+        if (string.IsNullOrEmpty(name))
+            return false;
+
+        var native = false;
+        try
+        {
+            native = HeroineActionBridge.TryPlayNative(name, clip);
+        }
+        catch (Exception e)
+        {
+            Plugin.Log.LogWarning("[Chill Clock] 恢复播放失败: " + e.Message);
+            return false;
+        }
+
+        if (!native)
+            _source.PlayOneShot(clip);
+        _playingNative = native;
+
+        HeroineActionBridge.SetMouthTalk(true);
+        Plugin.Log.LogInfo("[Chill Clock] 被短音打断，重放这一句: " + name);
+        speaking = true;
+        progress = 0f;
+        return true;
+    }
+
     private IEnumerator DriveMouth(AudioClip clip, VoiceLine line)
     {
+        // 见下面 ResumeAfterShortCut：被短音打断时用它重放当前句
         var spans = line?.TalkSpans;
+        // 小课堂这批是我们自己用 AudioSource 播的，游戏那边 Stop 不到它；
+        // 所以**不要**再因为"游戏在说话/在演出"就判成被打断（那样等于自己把自己停了）。
+        var independent = !string.IsNullOrEmpty(line?.Action);
         if (spans == null || spans.Length < 2)
         {
             // 老语音包没有分段信息：整条开着嘴。但中途被游戏掐了也要立刻收，
@@ -758,10 +902,32 @@ internal sealed class VoiceManager
             _chainStage = "口型（无分段）";
             while (waited < tail && Time.realtimeSinceStartup < tailDeadline)
             {
-                if (IsInterrupted(clip, waited))
+                if (!independent && IsInterrupted(clip, waited))
                 {
-                    Interrupt();
-                    yield break;
+                    // 她**自己**开口（台词/自言自语）-> 让路，整段不讲了
+                    if (HeroineActionBridge.IsGameVoiceBusy())
+                    {
+                        Interrupt();
+                        yield break;
+                    }
+
+                    // 只是短的动作声音（呼呼吹气、翻书嗯声…）把我们掐了：
+                    // 等它放完，把这句从头再说一遍，然后接着往下讲。
+                    var mouthOn = true;
+                    if (!ResumeAfterShortCut(clip, line, ref waited, ref mouthOn))
+                    {
+                        Interrupt();
+                        yield break;
+                    }
+                }
+
+                // 她起身开窗/关窗这类演出会把字幕框收走：我们这句还没播完就补回来
+                if (line != null && _subtitle != null && !_subtitle.IsShowing &&
+                    waited < clip.length - 0.3f)
+                {
+                    var en = string.IsNullOrEmpty(line.English) ? line.Japanese : line.English;
+                    _subtitle.Show(LocalizedText.Pick(line.Chinese, en, line.Japanese),
+                                   clip.length - waited);
                 }
 
                 waited += Time.unscaledDeltaTime;
@@ -779,10 +945,19 @@ internal sealed class VoiceManager
         _chainStage = "口型 " + line?.File;
         while (elapsed < clip.length && Time.realtimeSinceStartup < mouthDeadline)
         {
-            if (IsInterrupted(clip, elapsed))
+            if (!independent && IsInterrupted(clip, elapsed))
             {
-                Interrupt();
-                yield break;
+                if (HeroineActionBridge.IsGameVoiceBusy())
+                {
+                    Interrupt();
+                    yield break;
+                }
+
+                if (!ResumeAfterShortCut(clip, line, ref elapsed, ref speaking))
+                {
+                    Interrupt();
+                    yield break;
+                }
             }
 
             var shouldTalk = InSpans(spans, elapsed);
@@ -790,6 +965,15 @@ internal sealed class VoiceManager
             {
                 speaking = shouldTalk;
                 HeroineActionBridge.SetMouthTalk(speaking);
+            }
+
+            // 同上：她开窗/关窗把字幕收走了就补回来
+            if (line != null && _subtitle != null && !_subtitle.IsShowing &&
+                elapsed < clip.length - 0.3f)
+            {
+                var en = string.IsNullOrEmpty(line.English) ? line.Japanese : line.English;
+                _subtitle.Show(LocalizedText.Pick(line.Chinese, en, line.Japanese),
+                               clip.length - elapsed);
             }
 
             elapsed += Time.unscaledDeltaTime;
@@ -843,6 +1027,17 @@ internal sealed class VoiceManager
     {
         var clipName = Path.GetFileNameWithoutExtension(fileName);
         var native = false;
+        var isScenarioLine = _catalog.TryGetValue(fileName, out var scenarioLine) &&
+                             !string.IsNullOrEmpty(scenarioLine.Action);
+
+        // 小课堂这批（目录里配了动作的）**不走游戏的语音系统**：
+        // 游戏自己每次播它的动作音效（喝咖啡"呼呼"、翻书）都会先 VoiceManager.Stop()，
+        // 那一下会把挂在它上面的我们的音频一起掐掉。用我们自己的 AudioSource 播，
+        // 它的 Stop() 就管不着了 —— 口型本来就是我们自己开关的，没影响。
+        // 改回**用游戏自己的语音系统**播（用户要求）：
+        // 这样音量/静音跟随游戏设置里的那一档，不会被我们自己的音量顶掉；
+        // 代价是游戏一播它自己的东西（呼呼声、翻书声、她的台词）就会把我们掐断 ——
+        // 掐断后的恢复逻辑见 PlayChain（短音恢复、她自己说话则不恢复）。
         try
         {
             native = HeroineActionBridge.TryPlayNative(clipName, clip);
@@ -857,6 +1052,12 @@ internal sealed class VoiceManager
 
         _playingNative = native;
 
+        // 我们这句要响多久：这段时间里，游戏"挂在动作上的小声音"（Motion_*）不播，
+        // 免得她一边喝咖啡一边讲话。（Harmony 补丁读这个时间戳）
+        var until = Time.realtimeSinceStartup + clip.length + 0.3f;
+        if (until > UI.MotionVoiceSuppressPatch.SpeakingUntil)
+            UI.MotionVoiceSuppressPatch.SpeakingUntil = until;
+
         // 口型由我们自己开关：VoiceManager.Play 不管这个，
         // 也不能走 HeroineVoiceController.PlayVoice（会把 _isFinishedVoice 卡死）。
         HeroineActionBridge.SetMouthTalk(true);
@@ -866,7 +1067,15 @@ internal sealed class VoiceManager
 
         // 念台词时按游戏自己的规则来（她干活时不动身体、只转头；不在干活时只换表情），
         // 链子结束时统一把视线放回去。连播组只在第一句转头。
-        HeroineActionBridge.Play(line.Emotion, _nextIsClick, firstLineOfChain, _gestureChance);
+        // 目录里给这句配了动作的话，出手概率抬高一点，不然配了也基本看不到。
+        var chance = _gestureChance;
+        // 剧情式台词（目录里配了动作的）：她大部分时间是安静坐着说话的，
+        // 只偶尔配一个小动作（像剧情/小课堂里那样，讲到有趣的地方笑一下），
+        // 不该每句都换姿势 —— 聪音本来就是个内敛的人。
+        // 提醒类池子照样是 0（那时候她该看着你说，不该换姿势）。
+        if (!string.IsNullOrEmpty(line.Action) && chance > 0)
+            chance = 30;
+        HeroineActionBridge.Play(line.Emotion, _nextIsClick, firstLineOfChain, chance, line.Action);
         _nextIsClick = false;
 
         // 英文还没翻译完时，英语用户至少能看到日文原文，不至于空字幕
@@ -1237,6 +1446,9 @@ internal sealed class VoiceManager
                 HourFrom = hourFrom,
                 HourTo = hourTo
             };
+            // 第 13 列（可选）：这句台词配的动作（数字 = 动作 id，或 Happy / Think 这类键）
+            if (parts.Length > 12)
+                line.Action = parts[12].Trim();
             _catalog[line.File] = line;
         }
     }
@@ -1307,12 +1519,20 @@ internal sealed class VoiceManager
             if (!string.IsNullOrEmpty(line.SeqGroup) && line.SeqOrder > 1)
                 continue;
 
-            if (!_pools.TryGetValue(trigger, out var pool))
+            // Trigger 可以写多个池子（用 | 分隔）：同一句既能在待机闲聊里出现，
+            // 也能在休息闲聊 / 点击回应里出现。
+            foreach (var one in trigger.Split('|'))
             {
-                pool = new List<string>();
-                _pools[trigger] = pool;
+                var key = one.Trim();
+                if (key.Length == 0)
+                    continue;
+                if (!_pools.TryGetValue(key, out var pool))
+                {
+                    pool = new List<string>();
+                    _pools[key] = pool;
+                }
+                pool.Add(line.File);
             }
-            pool.Add(line.File);
         }
 
         // 启动时把每个池子有多少条写进日志：一眼就能看出"是不是池子空了"
@@ -1423,6 +1643,7 @@ internal sealed class VoiceManager
         public string SeqGroup;
         public int SeqOrder;
         public string Time;
+        public string Action;
 
         /// <summary>
         /// 节日 id（目录第 11 列，可选）。空表示平时都能用；
