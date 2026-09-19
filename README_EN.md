@@ -36,22 +36,22 @@ A BepInEx plugin for *Chill with You : Lo-Fi Story*: **when Satone is focusing, 
 - Satone can play voice reminders when you get distracted, open Task Manager, or try to exit;
 - The settings UI is localized in Simplified Chinese / English / Japanese.
 
-**Satone's voice lines (2,013 in total, all embedded in the DLL)**
+**Satone's voice lines (1,738 in total, all embedded in the DLL)**
 
 | Scene | Total | Chained | Single |
 | --- | ---: | ---: | ---: |
 | Idle chat during focus | 466 | 115 | 351 |
-| Click during focus | 200 | 119 | 81 |
-| Click during a break | 200 | 116 | 84 |
-| Click outside focus | 200 | 111 | 89 |
+| Click during focus | 129 | 44 | 85 |
+| Click during a break | 134 | 44 | 90 |
+| Click outside focus | 62 | 4 | 58 |
 | Distraction reminders | 328 | 163 | 165 |
 | Break reminders | 110 | 30 | 80 |
 | Task Manager interception | 110 | 30 | 80 |
 | Game exit interception | 110 | 30 | 80 |
 | Mini-lecture stories (idle / break chat, clicks) | 289 | 289 | 0 |
-| **Total** | **2,013** | **1,003** | **1,010** |
+| **Total** | **1,738** | **749** | **989** |
 
-> "Chained" means a run of lines spoken back to back — 392 chains in total, 53 of which are the "mini-lecture" stories (4–20 lines each). The 289 mini-lecture lines go into the click-outside-focus / click-during-break / idle chat / break chat pools. There are also 36 festival lines, spoken only once on the day itself and split by morning / noon / evening / night. The voice pack is embedded in `ChillClock.dll`, so no extra voice folder is needed.
+> "Chained" means a run of lines spoken back to back — 260 chains in total, 53 of which are the "mini-lecture" stories (4–20 lines each). The 289 mini-lecture lines go into the click-outside-focus / click-during-break / idle chat / break chat pools. There are also 36 festival lines, spoken only once on the day itself and split by morning / noon / evening / night. The voice pack is embedded in `ChillClock.dll`, so no extra voice folder is needed.
 
 ## Installation
 
