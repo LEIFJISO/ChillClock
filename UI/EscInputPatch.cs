@@ -19,6 +19,8 @@ namespace ChillFocusWhitelist.UI;
 
 internal static class EscInputPatch
 {
+    private static bool _logged;
+
     /// <summary>
     /// 专注期间（且开了"专注时禁止关闭游戏"）让 ESC 读不到：
     /// 结果直接给 false，并跳过原方法。
@@ -30,10 +32,65 @@ internal static class EscInputPatch
             return true;
 
         var plugin = Plugin.Instance;
-        if (plugin == null || !plugin.ShouldBlockGameExit())
+        if (plugin == null || !plugin.ShouldBlockEscape())
+        {
+            // 按了 ESC 但没拦：把闸门状态写一次日志，免得"没生效"没法查
+            LogMissOnce(plugin);
             return true;
+        }
 
+        LogOnce("Input.GetKey*(Escape)");
         __result = false;
         return false;
+    }
+
+    /// <summary>
+    /// 还有一条路要堵：Unity 的 UI（EventSystem / StandaloneInputModule）关面板用的是
+    /// <c>Input.GetButtonDown("Cancel")</c>，而 "Cancel" 在键盘上就是 ESC。
+    /// 只堵 KeyCode 版的话，用 ESC 打开/关闭游戏里的设置、结束通话那些面板还是能穿过去。
+    /// </summary>
+    [HarmonyPrefix]
+    private static bool PrefixButton(string buttonName, ref bool __result)
+    {
+        if (string.IsNullOrEmpty(buttonName))
+            return true;
+        if (!buttonName.Equals("Cancel", System.StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var plugin = Plugin.Instance;
+        if (plugin == null || !plugin.ShouldBlockEscape())
+        {
+            LogMissOnce(plugin);
+            return true;
+        }
+
+        LogOnce("Input.GetButton*(Cancel)");
+        __result = false;
+        return false;
+    }
+
+    /// <summary>第一次真的拦住时写一条日志，方便确认"到底有没有生效"。</summary>
+    private static void LogOnce(string what)
+    {
+        if (_logged)
+            return;
+        _logged = true;
+        Plugin.Log.LogInfo("[Chill Clock] ESC 拦截生效：" + what + " 被挡掉了");
+    }
+
+    private static bool _loggedMiss;
+
+    /// <summary>
+    /// 收到 ESC 但闸门是关的（比如不在专注中）时写一次日志：
+    /// 这样"ESC 没拦住"能立刻分辨是"闸门没开"还是"根本没走到我们的补丁"。
+    /// </summary>
+    private static void LogMissOnce(Plugin plugin)
+    {
+        if (_loggedMiss)
+            return;
+        _loggedMiss = true;
+        Plugin.Log.LogInfo("[Chill Clock] 收到 ESC，但这次放行了：插件开关=" +
+                           (plugin != null && plugin.IsEscapeBlockConfigured()) +
+                           " 结束通话演出中=" + (plugin == null || !plugin.ShouldBlockEscape()));
     }
 }

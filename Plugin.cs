@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-public const string Version = "0.9.5";
+public const string Version = "0.9.6";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -253,6 +253,15 @@ public const string Version = "0.9.5";
                 if (target == null)
                     continue;
                 _harmony.Patch(target, prefix: PatchMethod("EscInputPatch", "Prefix"));
+                escPatched++;
+            }
+            // UI 那条路：EventSystem 关面板走的是 Input.GetButtonDown("Cancel")，键盘上就是 ESC。
+            foreach (var inputMethod in new[] { "GetButtonDown", "GetButton", "GetButtonUp" })
+            {
+                var target = AccessTools.Method(inputType, inputMethod, new[] { typeof(string) });
+                if (target == null)
+                    continue;
+                _harmony.Patch(target, prefix: PatchMethod("EscInputPatch", "PrefixButton"));
                 escPatched++;
             }
             Log.LogInfo("[Chill Clock] ESC 拦截已挂 " + escPatched + " 个输入方法（进程内，无全局钩子）");
@@ -801,6 +810,34 @@ public const string Version = "0.9.5";
             return false;
 
         // 游戏自己正在走"结束通话"演出时放行，否则它的收尾流程会被我们卡住
+        if (HeroineActionBridge.IsGameEndingCall())
+            return false;
+
+        return true;
+    }
+
+    /// <summary>ESC 拦截的"设置层"状态（总开关 + 专注时禁止关闭游戏）。诊断日志用。</summary>
+    internal bool IsEscapeBlockConfigured()
+    {
+        return _masterEnabled.Value;
+    }
+
+    /// <summary>"这会儿算不算专注/休息中"。诊断日志用。</summary>
+    internal bool IsFocusGateOpen()
+    {
+        return _focusActive || IsPomodoroSessionActive();
+    }
+
+    /// <summary>
+    /// ESC 要不要拦。**和"专注时禁止关闭游戏"那个开关无关**，只要插件开着就拦
+    ///（用户要求：默认生效）。唯一的例外是游戏自己在走"结束通话"演出的时候，
+    /// 那时候放行，免得把它的收尾流程卡死。
+    /// </summary>
+    internal bool ShouldBlockEscape()
+    {
+        if (!_masterEnabled.Value)
+            return false;
+
         if (HeroineActionBridge.IsGameEndingCall())
             return false;
 
