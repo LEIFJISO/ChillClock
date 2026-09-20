@@ -59,7 +59,7 @@
 
 ### 步骤
 1. **安装 BepInEx**
-* 从上方链接下载 BepInEx。
+* 从上方链接下载 BepInEx `[BepInEx_win_x64_5.4.23.5.zip]`。
 * 解压至游戏根目录。
 * 运行一次游戏以生成 BepInEx 相关文件夹（能看到 `[游戏根目录]/BepInEx/plugins/`）。
 
