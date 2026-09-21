@@ -6,6 +6,10 @@ namespace ChillFocusWhitelist.Core;
 public sealed class WindowGuard
 {
     private readonly WhitelistStore _store;
+
+    /// <summary>窗口标题规则（可为 null：只按进程白名单跑）。</summary>
+    private readonly WindowRuleStore _rules;
+
     private readonly HashSet<IntPtr> _minimizedByUs = new HashSet<IntPtr>();
     private readonly object _lock = new object();
     private float _nextSkipLog;
@@ -19,9 +23,10 @@ public sealed class WindowGuard
     /// <summary>请它关闭到认定"关不掉"之间的宽限时间（正常情况任务管理器是秒关的）。</summary>
     private const float CloseGraceSeconds = 1.5f;
 
-    public WindowGuard(WhitelistStore store)
+    public WindowGuard(WhitelistStore store, WindowRuleStore rules = null)
     {
         _store = store;
+        _rules = rules;
     }
 
     public Action<string, bool> OnWindowMinimized { get; set; }
@@ -119,7 +124,32 @@ public sealed class WindowGuard
                 continue;
             if (Win32.IsMinimized(window.Handle))
                 continue;
-            if (_store.IsAllowed(window.ProcessPath, window.ProcessName))
+
+            // 白名单是"进程级"，窗口规则在它之上再判一次窗口标题（见 WindowRuleStore）：
+            //   Block / Restricted → 收起（即使进程在白名单）
+            //   Allow              → 放行（即使进程不在白名单）
+            //   None               → 按原白名单
+            var allowed = _store.IsAllowed(window.ProcessPath, window.ProcessName);
+            string ruleHit = null;
+            if (_rules != null && !window.IsTaskManager)
+            {
+                var decision = _rules.Evaluate(window.ProcessPath, window.ProcessName, window.Title);
+                if (decision == WindowRuleDecision.Block || decision == WindowRuleDecision.Restricted)
+                {
+                    allowed = false;
+                    if (decision == WindowRuleDecision.Block)
+                        ruleHit = _rules.MatchedRuleDescription(
+                            window.ProcessPath, window.ProcessName, window.Title);
+                    else
+                        ruleHit = "restricted（该进程有 allow 规则，标题未命中）";
+                }
+                else if (decision == WindowRuleDecision.Allow)
+                {
+                    allowed = true;
+                }
+            }
+
+            if (allowed)
                 continue;
 
             if (window.IsTaskManager)
@@ -137,7 +167,9 @@ public sealed class WindowGuard
                 _minimizedByUs.Add(window.Handle);
                 if (allowVoice)
                     OnWindowMinimized?.Invoke(window.ProcessName, false);
-                Plugin.Log.LogInfo("[Chill Clock] minimized window: " + window.ProcessName);
+                Plugin.Log.LogInfo("[Chill Clock] minimized window: " + window.ProcessName +
+                                   (string.IsNullOrEmpty(window.Title) ? "" : " \"" + window.Title + "\"") +
+                                   (ruleHit == null ? "" : "  ← 规则 " + ruleHit));
             }
         }
 

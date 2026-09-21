@@ -34,6 +34,7 @@ A BepInEx plugin for *Chill with You : Lo-Fi Story*: **when Satone is focusing, 
 - Works with both **Pomodoro** and **Count-up** timer modes;
 - Settings include "Disable End/Skip in Focus", "Hide Side UI in Focus" and "Block Game Exit in Focus" (this one also keeps Steam from being closed, since quitting Steam force-kills the game — add Steam to the whitelist to disable that part);
 - Satone can play voice reminders when you get distracted, open Task Manager, or try to exit;
+- **Window title rules** add per-window filtering on top of the process-level whitelist — multi-window apps like Chrome/Edge can be allowed or minimized by window title (including Chromium "named windows"). The settings page has "Add Rule from Windows" and "Test Window Matching" (a simulation; nothing is actually minimized);
 - The settings UI is localized in Simplified Chinese / English / Japanese.
 
 **Satone's voice lines (1,722 in total, all embedded in the DLL)**
@@ -52,6 +53,27 @@ A BepInEx plugin for *Chill with You : Lo-Fi Story*: **when Satone is focusing, 
 | **Total** | **1,722** | **749** | **973** |
 
 > "Chained" means a run of lines spoken back to back — 260 chains in total, 53 of which are the "mini-lecture" stories (4–20 lines each). The 289 mini-lecture lines go into the click-outside-focus / click-during-break / idle chat / break chat pools. There are also 36 festival lines, spoken only once on the day itself and split by morning / noon / evening / night. The voice pack is embedded in `ChillClock.dll`, so no extra voice folder is needed.
+
+## Window title rules (per-window filtering)
+
+The whitelist works at **process** level, so an app with multiple windows (browsers!) is allowed as a whole. Window title rules add a per-window check on top (title = the active tab, or the static name of a Chromium "named window"):
+
+| Mode | Behavior |
+| --- | --- |
+| `block` | Matching windows are always minimized (even if the process is whitelisted) |
+| `allow` | Matching windows are always kept; once a process has any `allow` rule, its other windows (with a non-empty title) are minimized — a per-window whitelist |
+
+- File: `BepInEx/plugins/WindowRules.txt` (created automatically with commented examples; all examples are disabled by default)
+- Format: `process|title-pattern|mode`; `*` and `?` wildcards, or plain substring match when no wildcard is used (case-insensitive)
+- In the settings page: "Add Rule from Windows" generates a title-pattern draft from a window; "Test Window Matching" simulates the verdict of the current rules + whitelist without minimizing anything
+
+**Example: use Chrome/Edge "named windows" as a pass**
+
+1. Right-click the tab strip → "Name window" and name your work window `[CC]work` (the OS window title then stays that name and no longer follows the page title);
+2. Add strict rules `chrome.exe|*[CC]*|allow`, `msedge.exe|*[CC]*|allow` — or loose rules `chrome.exe|* - Google Chrome|block`, `msedge.exe|* - Microsoft Edge|block` (every unnamed window gets minimized);
+3. During focus, unnamed/unmarked browser windows are minimized while the marked work window stays.
+
+> Limitation: Windows can only see the **active tab's** title (or the name of a named window). Switching to a distracting tab inside an allowed window, and background tabs, cannot be detected individually. Tab-level control requires a companion browser extension, planned for a later release; its action will be **switching back to a whitelisted tab** rather than minimizing the window. Firefox has no built-in window naming; use the Window Titler extension instead.
 
 ## Installation
 

@@ -20,6 +20,7 @@ internal sealed class SettingsPageInjector
     private const float RowHeight = 60.9f;
 
     private readonly WhitelistStore _store;
+    private readonly WindowRuleStore _windowRules;
     private readonly Func<bool> _getMasterEnabled;
     private readonly Action<bool> _setMasterEnabled;
     private readonly Func<bool> _getDisableStopSkip;
@@ -39,7 +40,16 @@ internal sealed class SettingsPageInjector
     private bool _wasActive;
     private float _nextPollTime;
     private float _nextForeignHookTime;
-    private bool _pickerMode;
+    private PickerMode _pickerMode;
+
+    /// <summary>设置页当前处于哪个子视图：主设置 / 白名单选择器 / 规则选择器 / 匹配测试。</summary>
+    private enum PickerMode
+    {
+        None,
+        Whitelist,
+        Rule,
+        MatchTest
+    }
 
     private GameObject _pageRoot;
     private GameObject _pickerRoot;
@@ -57,6 +67,7 @@ internal sealed class SettingsPageInjector
 
     public SettingsPageInjector(
         WhitelistStore store,
+        WindowRuleStore windowRules,
         Func<bool> getMasterEnabled,
         Action<bool> setMasterEnabled,
         Func<bool> getDisableStopSkip,
@@ -71,6 +82,7 @@ internal sealed class SettingsPageInjector
         Action<bool> setAmbientVoice)
     {
         _store = store;
+        _windowRules = windowRules;
         _getMasterEnabled = getMasterEnabled;
         _setMasterEnabled = setMasterEnabled;
         _getDisableStopSkip = getDisableStopSkip;
@@ -115,6 +127,8 @@ internal sealed class SettingsPageInjector
         ForceGeneralDefault();
         ApplyPendingFile();
         HookForeignTabs();
+        // 每次打开设置页都重读一次规则文件：手改 WindowRules.txt 之后无需重启游戏
+        _windowRules?.Reload();
         RequestRebuild();
     }
 
@@ -240,7 +254,7 @@ internal sealed class SettingsPageInjector
 
         _rowWidth = RowWidth;
 
-        if (_pickerMode)
+        if (_pickerMode != PickerMode.None)
         {
             BuildPickerRows();
             return;
@@ -312,6 +326,40 @@ internal sealed class SettingsPageInjector
         {
             AddChild(CreateSectionRow(
                 LocalizedText.Pick("（暂无白名单应用）", "(No apps yet)", "（ホワイトリストにアプリがありません）")));
+        }
+
+        // 9. 窗口标题规则：白名单之上的窗口级筛选（浏览器多窗口 / 命名窗口等）。
+        AddChild(CreateSectionRow(LocalizedText.Pick(
+            "窗口标题规则", "Window Title Rules", "ウィンドウタイトルのルール")));
+        AddChild(CreateDividerRow());
+
+        AddChild(CreateActionRow(
+            LocalizedText.Pick("从窗口列表添加规则", "Add Rule from Windows", "ウィンドウからルール追加"),
+            LocalizedText.Pick("打开窗口列表", "Window List", "ウィンドウ一覧"),
+            OpenRulePicker));
+
+        AddChild(CreateActionRow(
+            LocalizedText.Pick("窗口匹配测试", "Test Window Matching", "ウィンドウのマッチングテスト"),
+            LocalizedText.Pick("测试当前窗口", "Test Current Windows", "現在のウィンドウをテスト"),
+            OpenMatchTest));
+
+        var rules = _windowRules != null
+            ? _windowRules.Rules
+            : (IReadOnlyList<WindowRule>)Array.Empty<WindowRule>();
+        foreach (var rule in rules)
+        {
+            var row = CreateRuleRow(rule);
+            if (row != null)
+            {
+                _appRows.Add(row);
+                AddChild(row);
+            }
+        }
+
+        if (rules.Count == 0)
+        {
+            AddChild(CreateSectionRow(LocalizedText.Pick(
+                "（暂无窗口规则）", "(No window rules yet)", "（ウィンドウルールはありません）")));
         }
 
         ForceLayoutRebuild(_scrollContent);
@@ -429,13 +477,44 @@ internal sealed class SettingsPageInjector
 
     private void OpenWindowPicker()
     {
-        _pickerMode = true;
+        OpenPicker(PickerMode.Whitelist);
+    }
+
+    private void OpenRulePicker()
+    {
+        OpenPicker(PickerMode.Rule);
+    }
+
+    private void OpenMatchTest()
+    {
+        OpenPicker(PickerMode.MatchTest);
+    }
+
+    private void OpenPicker(PickerMode mode)
+    {
+        _pickerMode = mode;
         RequestRebuild();
     }
 
     private void BuildPickerRows()
     {
         RefreshUiLanguage();
+        switch (_pickerMode)
+        {
+            case PickerMode.Rule:
+                BuildRulePickerRows();
+                return;
+            case PickerMode.MatchTest:
+                BuildMatchTestRows();
+                return;
+            default:
+                BuildWhitelistPickerRows();
+                return;
+        }
+    }
+
+    private void BuildWhitelistPickerRows()
+    {
         AddChild(CreateActionRow(
             LocalizedText.Pick("从当前窗口添加应用", "Add App from Windows", "ウィンドウからアプリ追加"),
             LocalizedText.Pick("返回设置", "Back to Settings", "設定に戻る"),
@@ -455,7 +534,7 @@ internal sealed class SettingsPageInjector
             {
                 if (_store.TryAdd(candidate.Path))
                 {
-                    _pickerMode = false;
+                    _pickerMode = PickerMode.None;
                     RequestRebuild();
                 }
                 else
@@ -471,6 +550,303 @@ internal sealed class SettingsPageInjector
         }
 
         ForceLayoutRebuild(_scrollContent);
+    }
+
+    /// <summary>
+    /// 规则选择器：按窗口列出（同一个进程的多个窗口会分别出现），
+    /// 每个窗口两个按钮 —— 允许（allow） / 屏蔽（block）。
+    /// 标题模式由当前窗口标题自动生成，之后可以在 WindowRules.txt 里手改细调。
+    /// </summary>
+    private void BuildRulePickerRows()
+    {
+        AddChild(CreateActionRow(
+            LocalizedText.Pick("从窗口列表添加规则", "Add Rule from Windows", "ウィンドウからルール追加"),
+            LocalizedText.Pick("返回设置", "Back to Settings", "設定に戻る"),
+            HidePicker));
+
+        var candidates = WindowCandidates.EnumerateWindows();
+        if (candidates.Count == 0)
+        {
+            AddChild(CreateSectionRow(LocalizedText.Pick(
+                "（没有检测到可添加的窗口）", "(No windows found)", "（追加できるウィンドウが見つかりません）")));
+            return;
+        }
+
+        AddChild(CreateSectionRow(LocalizedText.Pick(
+            "“允许”= 只放行标题匹配的窗口；“屏蔽”= 标题匹配的窗口一律收起。模式可稍后在 WindowRules.txt 里手改。",
+            "\"Allow\" keeps only matching windows; \"Block\" always minimizes matching windows. Patterns can be edited later in WindowRules.txt.",
+            "「許可」= 一致したウィンドウだけ残す。「ブロック」= 一致したウィンドウを最小化。パターンは後で WindowRules.txt で編集できます。")));
+
+        foreach (var candidate in candidates)
+        {
+            var row = CreateRulePickerRow(candidate, allow =>
+            {
+                var pattern = BuildTitlePattern(candidate.Title);
+                var result = _windowRules.TryAdd(candidate.Name, pattern, allow);
+                if (result == WindowRuleAddResult.Added)
+                {
+                    ShowToast(LocalizedText.Pick(
+                        "已添加规则：" + (allow ? "允许 " : "屏蔽 ") + pattern,
+                        "Rule added: " + (allow ? "allow " : "block ") + pattern,
+                        "ルール追加: " + (allow ? "許可 " : "ブロック ") + pattern));
+                }
+                else if (result == WindowRuleAddResult.Duplicate)
+                {
+                    ShowToast(LocalizedText.Pick(
+                        "规则已存在：" + pattern,
+                        "Rule already exists: " + pattern,
+                        "同じルールが既にあります: " + pattern));
+                }
+                else
+                {
+                    ShowToast(LocalizedText.Pick(
+                        "规则格式不正确", "Invalid rule", "ルールの形式が不正です"));
+                }
+            });
+            if (row != null)
+                AddChild(row);
+        }
+
+        ForceLayoutRebuild(_scrollContent);
+    }
+
+    /// <summary>
+    /// 匹配测试：把当前所有窗口按"白名单 + 规则"模拟判定一遍（只显示结果，不真的收窗口）。
+    /// 专门用来验证规则写得对不对、以及命名窗口有没有生效。
+    /// </summary>
+    private void BuildMatchTestRows()
+    {
+        AddChild(CreateActionRow(
+            LocalizedText.Pick("窗口匹配测试", "Test Window Matching", "ウィンドウのマッチングテスト"),
+            LocalizedText.Pick("返回设置", "Back to Settings", "設定に戻る"),
+            HidePicker));
+
+        AddChild(CreateActionRow(
+            LocalizedText.Pick("刷新窗口列表", "Refresh Windows", "ウィンドウ一覧を更新"),
+            LocalizedText.Pick("刷新", "Refresh", "更新"),
+            RequestRebuild));
+
+        var candidates = WindowCandidates.EnumerateWindows();
+        if (candidates.Count == 0)
+        {
+            AddChild(CreateSectionRow(LocalizedText.Pick(
+                "（没有检测到窗口）", "(No windows found)", "（ウィンドウが見つかりません）")));
+            ForceLayoutRebuild(_scrollContent);
+            return;
+        }
+
+        AddChild(CreateSectionRow(LocalizedText.Pick(
+            "以下是当前规则 + 白名单的模拟判定（不会真的收窗口）：",
+            "Simulated result of the current rules + whitelist (nothing is minimized):",
+            "現在のルールとホワイトリストによる判定結果です（実際には最小化しません）：")));
+
+        foreach (var candidate in candidates)
+        {
+            var row = CreateSectionRow(BuildMatchVerdict(candidate));
+            if (row != null)
+            {
+                _appRows.Add(row);
+                AddChild(row);
+            }
+        }
+
+        ForceLayoutRebuild(_scrollContent);
+    }
+
+    private GameObject CreateRulePickerRow(AppWindowCandidate candidate, Action<bool> onPick)
+    {
+        var display = Path.GetFileNameWithoutExtension(candidate.Name);
+        if (string.IsNullOrWhiteSpace(display))
+            display = candidate.Name;
+
+        var row = CloneTemplate(
+            "Rule_" + display + "_" + candidate.Title,
+            display + " · " + Truncate(candidate.Title, 60));
+        if (row == null)
+            return null;
+
+        var buttons = row.GetComponentsInChildren<Button>(true).ToList();
+        var allowButton = buttons.FirstOrDefault(b => b.name.Contains("OnButton"));
+        var blockButton = buttons.FirstOrDefault(b => b.name.Contains("OffButton"));
+        if (allowButton == null || blockButton == null)
+        {
+            Object.Destroy(row);
+            return null;
+        }
+
+        allowButton.gameObject.SetActive(true);
+        allowButton.onClick.RemoveAllListeners();
+        allowButton.interactable = true;
+        SetButtonText(allowButton, LocalizedText.Pick("允许", "Allow", "許可"));
+        allowButton.onClick.AddListener(() =>
+        {
+            PlayClickSound();
+            onPick?.Invoke(true);
+        });
+        allowButton.GetComponent<InteractableUI>()?.ActivateUseUI(false);
+
+        blockButton.onClick.RemoveAllListeners();
+        blockButton.interactable = true;
+        SetButtonText(blockButton, LocalizedText.Pick("屏蔽", "Block", "ブロック"));
+        blockButton.onClick.AddListener(() =>
+        {
+            PlayClickSound();
+            onPick?.Invoke(false);
+        });
+        blockButton.GetComponent<InteractableUI>()?.ActivateUseUI(false);
+
+        var iconTexture = AppIcon.LoadTexture(candidate.Path);
+        if (iconTexture != null)
+        {
+            var iconObject = new GameObject("Icon", typeof(RectTransform), typeof(Image));
+            iconObject.transform.SetParent(row.transform, false);
+            var image = iconObject.GetComponent<Image>();
+            image.sprite = Sprite.Create(iconTexture, new Rect(0, 0, iconTexture.width, iconTexture.height),
+                new Vector2(0.5f, 0.5f));
+            image.raycastTarget = false;
+            image.preserveAspect = true;
+            PlaceIconLeftOfTitle(row, image.rectTransform, 40f);
+        }
+
+        return row;
+    }
+
+    private string BuildMatchVerdict(AppWindowCandidate candidate)
+    {
+        var whitelisted = _store.IsAllowed(candidate.Path, candidate.Name);
+        var decision = _windowRules != null
+            ? _windowRules.Evaluate(candidate.Path, candidate.Name, candidate.Title)
+            : WindowRuleDecision.None;
+
+        bool allowed;
+        string reason;
+        switch (decision)
+        {
+            case WindowRuleDecision.Block:
+                allowed = false;
+                reason = LocalizedText.Pick("命中屏蔽规则：", "matched block rule: ", "ブロックルールに一致: ") +
+                         _windowRules.MatchedRuleDescription(candidate.Path, candidate.Name, candidate.Title);
+                break;
+            case WindowRuleDecision.Allow:
+                allowed = true;
+                reason = LocalizedText.Pick("命中允许规则：", "matched allow rule: ", "許可ルールに一致: ") +
+                         _windowRules.MatchedRuleDescription(candidate.Path, candidate.Name, candidate.Title);
+                break;
+            case WindowRuleDecision.Restricted:
+                allowed = false;
+                reason = LocalizedText.Pick(
+                    "有允许规则但标题未命中（限制模式）",
+                    "allow rules exist, title not matched (restricted)",
+                    "許可ルールあり・タイトル不一致（制限モード）");
+                break;
+            default:
+                allowed = whitelisted;
+                reason = whitelisted
+                    ? LocalizedText.Pick("进程在白名单（无窗口规则）",
+                        "process whitelisted (no window rule)",
+                        "プロセスはホワイトリスト（ルールなし）")
+                    : LocalizedText.Pick("进程不在白名单",
+                        "process not whitelisted",
+                        "プロセスはホワイトリストにありません");
+                break;
+        }
+
+        var verdict = allowed
+            ? LocalizedText.Pick("[放行] ", "[Allow] ", "[許可] ")
+            : LocalizedText.Pick("[收起] ", "[Minimize] ", "[最小化] ");
+
+        return verdict + candidate.Name + " · " + Truncate(candidate.Title, 70) + " ← " + reason;
+    }
+
+    private GameObject CreateRuleRow(WindowRule rule)
+    {
+        if (rule == null)
+            return null;
+
+        var mode = rule.Allow
+            ? LocalizedText.Pick("允许", "Allow", "許可")
+            : LocalizedText.Pick("屏蔽", "Block", "ブロック");
+        var row = CloneTemplate(
+            "WindowRule_" + rule.Describe(),
+            mode + "  " + rule.Process + "  |  " + rule.Pattern);
+        if (row == null)
+            return null;
+
+        var buttons = row.GetComponentsInChildren<Button>(true).ToList();
+        var onButton = buttons.FirstOrDefault(b => b.name.Contains("OnButton"));
+        var offButton = buttons.FirstOrDefault(b => b.name.Contains("OffButton"));
+        if (onButton == null || offButton == null)
+        {
+            Object.Destroy(row);
+            return null;
+        }
+
+        onButton.gameObject.SetActive(false);
+        offButton.onClick.RemoveAllListeners();
+        offButton.interactable = true;
+        SetButtonText(offButton, LocalizedText.Pick("删除", "Delete", "削除"));
+        offButton.onClick.AddListener(() =>
+        {
+            PlayClickSound();
+            _windowRules.Remove(rule);
+            RequestRebuild();
+        });
+        offButton.GetComponent<InteractableUI>()?.ActivateUseUI(false);
+
+        return row;
+    }
+
+    /// <summary>窗口标题太长时只显示前 N 个字符（判定用完整标题，不用这个）。</summary>
+    private static string Truncate(string value, int maxLength)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+            return value ?? string.Empty;
+
+        return value.Substring(0, maxLength) + "…";
+    }
+
+    /// <summary>Chrome/Edge 等浏览器后缀关键词（命名窗口不带这些后缀）。</summary>
+    private static readonly string[] BrowserSuffixKeywords =
+    {
+        "Google Chrome", "Microsoft Edge", "Mozilla Firefox", "Firefox",
+        "Brave", "Opera", "Vivaldi", "Chromium", "360se", "360Chrome", "QQBrowser"
+    };
+
+    /// <summary>
+    /// 由当前窗口标题生成规则模式：
+    ///   "新标签页 - Google Chrome" → "*新标签页*"（去掉浏览器后缀）
+    ///   "工作台 - 个人 - Microsoft Edge" → "*工作台 - 个人*"（同上）
+    ///   命名窗口 "工作"（没有后缀） → "*工作*"
+    /// 生成的只是初稿，用户可以按需在 WindowRules.txt 里手改。
+    /// </summary>
+    private static string BuildTitlePattern(string title)
+    {
+        var value = (title ?? string.Empty).Trim();
+        if (value.Length == 0)
+            return string.Empty;
+
+        foreach (var separator in new[] { " - ", " — ", " – " })
+        {
+            var index = value.LastIndexOf(separator, StringComparison.Ordinal);
+            if (index <= 0)
+                continue;
+
+            var head = value.Substring(0, index).Trim();
+            var tail = value.Substring(index + separator.Length).Trim();
+            if (head.Length == 0 || tail.Length == 0)
+                continue;
+
+            foreach (var keyword in BrowserSuffixKeywords)
+            {
+                if (tail.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    value = head;
+                    break;
+                }
+            }
+        }
+
+        return "*" + value + "*";
     }
 
     private void RefreshUiLanguage()
@@ -573,9 +949,9 @@ internal sealed class SettingsPageInjector
 
     private void HidePicker()
     {
-        if (_pickerMode)
+        if (_pickerMode != PickerMode.None)
         {
-            _pickerMode = false;
+            _pickerMode = PickerMode.None;
             RequestRebuild();
         }
     }
@@ -1273,7 +1649,7 @@ internal sealed class SettingsPageInjector
         _pageBuilt = false;
         _dirty = true;
         _wasActive = false;
-        _pickerMode = false;
+        _pickerMode = PickerMode.None;
         _toast = null;
         _settingUi = null;
         _pageRoot = null;

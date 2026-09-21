@@ -18,7 +18,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string Guid = "com.chillclock.plugin";
     public const string Name = "Chill Clock";
-public const string Version = "0.9.6";
+    public const string Version = "0.10.0";
 
     internal static ManualLogSource Log = null!;
     internal static Plugin Instance = null!;
@@ -32,6 +32,7 @@ public const string Version = "0.9.6";
     private ConfigEntry<bool> _heroineReactions = null!;
     private ConfigEntry<bool> _clickReaction = null!;
     private WhitelistStore _store = null!;
+    private WindowRuleStore _windowRules = null!;
     private WindowGuard _guard = null!;
     private FocusSessionWatcher _watcher = null!;
     private SettingsPageInjector _ui = null!;
@@ -112,9 +113,14 @@ public const string Version = "0.9.6";
 
         var pluginDirectory = Path.GetDirectoryName(typeof(Plugin).Assembly.Location);
         var whitelistPath = Path.Combine(pluginDirectory ?? ".", "FocusWhitelist.txt");
+        var rulesPath = Path.Combine(pluginDirectory ?? ".", WindowRuleStore.FileName);
 
         _store = new WhitelistStore(whitelistPath);
-        _guard = new WindowGuard(_store);
+        // 窗口标题规则：白名单是进程级，规则在它之上按窗口标题细分（浏览器多窗口等）。
+        // 文件不存在时会自动生成一份带注释示例的模板（全部注释掉，不改变现有行为）。
+        _windowRules = new WindowRuleStore(rulesPath);
+        _windowRules.OnWarning = message => Logger.LogWarning("[Chill Clock] " + message);
+        _guard = new WindowGuard(_store, _windowRules);
         _watcher = new FocusSessionWatcher();
         _uiHider = new FocusUiHider();
         _steamCloseGuard = new SteamCloseGuard((path, name) => _store.IsAllowed(path, name));
@@ -126,6 +132,7 @@ public const string Version = "0.9.6";
         AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
         _ui = new SettingsPageInjector(
             _store,
+            _windowRules,
             () => _masterEnabled.Value,
             value => SetConfigValue(_masterEnabled, value),
             () => _disableStopSkip.Value,
@@ -276,7 +283,8 @@ public const string Version = "0.9.6";
             Logger.LogWarning("Harmony patch failed: " + e);
         }
 
-        Logger.LogInfo(Name + " v" + Version + " loaded. Whitelist: " + whitelistPath);
+        Logger.LogInfo(Name + " v" + Version + " loaded. Whitelist: " + whitelistPath +
+                       "  WindowRules: " + rulesPath + "（" + _windowRules.Rules.Count + " 条）");
     }
 
     internal void TickHost()

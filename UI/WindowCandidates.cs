@@ -52,6 +52,51 @@ internal static class WindowCandidates
         return result;
     }
 
+    /// <summary>
+    /// 按窗口枚举（**不去重进程**）：窗口标题规则需要"同一个进程的多个窗口"分别出现。
+    /// 只保留有标题的窗口 —— 规则匹配靠标题，没标题的没法做。
+    /// 完全相同（同一路径 + 同一标题）的窗口去重。
+    /// </summary>
+    public static List<AppWindowCandidate> EnumerateWindows()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<AppWindowCandidate>();
+
+        var windows = Win32.EnumerateAllTopLevelWindowsForPicker();
+        foreach (var window in windows)
+        {
+            if (window.IsShellWindow || window.IsStartMenuCandidate)
+                continue;
+            if (string.IsNullOrEmpty(window.ProcessPath))
+                continue;
+            if (string.IsNullOrWhiteSpace(window.ProcessName))
+                continue;
+            if (window.ProcessId == (uint)Win32.CurrentProcessId)
+                continue;
+            if (string.IsNullOrWhiteSpace(window.Title))
+                continue;
+            if (!seen.Add(window.ProcessPath + "\u0001" + window.Title))
+                continue;
+
+            result.Add(new AppWindowCandidate
+            {
+                Path = window.ProcessPath,
+                Name = window.ProcessName,
+                Title = window.Title
+            });
+        }
+
+        result.Sort((a, b) =>
+        {
+            var byProcess = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+            return byProcess != 0
+                ? byProcess
+                : string.Compare(a.Title, b.Title, StringComparison.OrdinalIgnoreCase);
+        });
+
+        return result;
+    }
+
     private static void AddProcessFallbackCandidates(
         List<AppWindowCandidate> result,
         HashSet<string> seen)
